@@ -4,9 +4,12 @@ mod ast;
 pub mod parser;
 use parser::parse_sql;
 use ast::{Command, MetaCmd, Stmt};
+mod engine;
+use engine::{Engine, QueryResult};
 
 fn main() {
     let user_name = "yuma";
+    let mut engine = Engine::new();
     loop {
         print!("{}>", user_name);
         io::stdout().flush().unwrap();
@@ -31,7 +34,16 @@ fn main() {
             }
             Ok(Command::Sql(stmt)) => {
                 println!("SQL Statement: {:?}", stmt);
-                // TODO: Execute SQL statement
+                match engine.execute(stmt) {
+                    Ok(QueryResult::Acknowledged) => println!("OK"),
+                    Ok(QueryResult::Rows { columns, rows }) => {
+                        println!("Columns: {:?}", columns);
+                        println!("Rows: {:?}", rows);
+                    },
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
