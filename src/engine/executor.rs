@@ -1,6 +1,5 @@
 // src/engine/executor.rs
-use crate::ast::{Stmt, ColumnType};
-use crate::storage::Storage;
+use crate::ast::{Stmt, ColumnType, Predicate, CmpOp};
 use super::{Engine, value::Value};
 
 #[derive(Debug)]
@@ -36,8 +35,18 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
         Stmt::Select { table, columns, filter } => {
             let schema = engine.storage().schema(&table)?;
             let cols = schema.iter().map(|c| c.name.clone()).collect();
-            let rows: Vec<Vec<Value>> = engine.storage().rows(&table)?.cloned().collect();
-            Ok(QueryResult::Rows { columns: cols, rows })
+            let all_rows: Vec<Vec<Value>> = engine.storage().rows(&table)?.cloned().collect();
+            
+            // WHERE条件でフィルタリング
+            let filtered_rows = if let Some(predicate) = filter {
+                all_rows.into_iter()
+                    .filter(|row| evaluate_predicate(&predicate, row, &schema))
+                    .collect()
+            } else {
+                all_rows
+            };
+            
+            Ok(QueryResult::Rows { columns: cols, rows: filtered_rows })
         }
     }
 }
@@ -52,5 +61,52 @@ fn parse_value(raw: &str, ty: &ColumnType) -> Result<Value, String> {
             "false" | "0" => Ok(Value::Bool(false)),
             _ => Err(format!("expected BOOL, got {raw:?}")),
         },
+    }
+}
+
+fn evaluate_predicate(predicate: &Predicate, row: &[Value], schema: &[crate::ast::ColumnDef]) -> bool {
+    match predicate {
+        Predicate::Cmp { col, op, val } => {
+            // 列名からインデックスを取得
+            if let Some(col_idx) = schema.iter().position(|c| &c.name == col) {
+                if let Some(row_val) = row.get(col_idx) {
+                    return evaluate_comparison(row_val, op, val);
+                }
+            }
+            false
+        }
+        Predicate::And(left, right) => {
+            evaluate_predicate(left, row, schema) && evaluate_predicate(right, row, schema)
+        }
+        Predicate::Or(left, right) => {
+            evaluate_predicate(left, row, schema) || evaluate_predicate(right, row, schema)
+        }
+    }
+}
+
+fn evaluate_comparison(left: &Value, op: &CmpOp, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(l), Value::Int(r)) => match op {
+            CmpOp::Eq => l == r,
+            CmpOp::Ne => l != r,
+            CmpOp::Lt => l < r,
+            CmpOp::Le => l <= r,
+            CmpOp::Gt => l > r,
+            CmpOp::Ge => l >= r,
+        },
+        (Value::Text(l), Value::Text(r)) => match op {
+            CmpOp::Eq => l == r,
+            CmpOp::Ne => l != r,
+            CmpOp::Lt => l < r,
+            CmpOp::Le => l <= r,
+            CmpOp::Gt => l > r,
+            CmpOp::Ge => l >= r,
+        },
+        (Value::Bool(l), Value::Bool(r)) => match op {
+            CmpOp::Eq => l == r,
+            CmpOp::Ne => l != r,
+            _ => false, // ブール値の大小比較は無効
+        },
+        _ => false, // 型が異なる場合は比較できない
     }
 }
