@@ -7,7 +7,7 @@ pub fn parse_select_all(s: &str) -> Result<Stmt, String> {
         && tokens[1] == "*"
         && tokens[2].eq_ignore_ascii_case("from")
     {
-        Ok(Stmt::SelectAll { table: tokens[3].trim_matches('"').to_string() })
+        Ok(Stmt::Select { table: tokens[3].trim_matches('"').to_string() })
     } else {
         Err("expected: SELECT * FROM <table>;".into())
     }

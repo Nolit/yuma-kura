@@ -1,5 +1,6 @@
 // src/engine/executor.rs
 use crate::ast::{Stmt, ColumnType};
+use crate::storage::Storage;
 use super::{Engine, value::Value};
 
 #[derive(Debug)]
@@ -11,35 +12,32 @@ pub enum QueryResult {
 pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, String> {
     match stmt {
         Stmt::CreateTable { table, columns } => {
-            engine.catalog_mut().create_table(table, columns)?;
+            engine.storage_mut().create_table(&table, columns)?;
             Ok(QueryResult::Acknowledged)
         }
         Stmt::InsertValues { table, values } => {
-            let tbl = engine.catalog_mut()
-                .get_table_mut(&table)
-                .ok_or_else(|| format!("no such table: {table}"))?;
+            let schema = engine.storage().schema(&table)?;
 
-            if values.len() != tbl.schema.len() {
+            if values.len() != schema.len() {
                 return Err(format!(
                     "column count mismatch: expected {}, got {}",
-                    tbl.schema.len(), values.len()
+                    schema.len(), values.len()
                 ));
             }
 
-            let parsed = values.iter().zip(&tbl.schema)
+            let parsed = values.iter().zip(schema)
                 .map(|(raw, col)| parse_value(raw, &col.data_type)
                      .map_err(|e| format!("column {}: {e}", col.name)))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            tbl.rows.push(parsed);
+            engine.storage_mut().insert_row(&table, parsed)?;
             Ok(QueryResult::Acknowledged)
         }
-        Stmt::SelectAll { table } => {
-            let tbl = engine.catalog()
-                .get_table(&table)
-                .ok_or_else(|| format!("no such table: {table}"))?;
-            let cols = tbl.schema.iter().map(|c| c.name.clone()).collect();
-            Ok(QueryResult::Rows { columns: cols, rows: tbl.rows.clone() })
+        Stmt::Select { table, columns, filter } => {
+            let schema = engine.storage().schema(&table)?;
+            let cols = schema.iter().map(|c| c.name.clone()).collect();
+            let rows: Vec<Vec<Value>> = engine.storage().rows(&table)?.cloned().collect();
+            Ok(QueryResult::Rows { columns: cols, rows })
         }
     }
 }

@@ -3,6 +3,7 @@ pub enum Value {
     Int(i64),
     Text(String),
     Bool(bool),
+    Null
 }
 
 impl std::fmt::Display for Value {
@@ -11,6 +12,7 @@ impl std::fmt::Display for Value {
             Value::Int(n) => write!(f, "{n}"),
             Value::Text(s) => write!(f, "{s}"),
             Value::Bool(b) => write!(f, "{b}"),
+            Value::Null => write!(f, "NULL"),
         }
     }
 }

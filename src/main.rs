@@ -3,9 +3,10 @@ use std::io::{self, Write};
 mod ast;
 pub mod parser;
 use parser::parse_sql;
-use ast::{Command, MetaCmd, Stmt};
+use ast::{Command, MetaCmd};
 mod engine;
 use engine::{Engine, QueryResult};
+mod storage;
 
 fn main() {
     let user_name = "yuma";
