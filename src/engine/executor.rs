@@ -37,7 +37,7 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
             let cols = schema.iter().map(|c| c.name.clone()).collect();
             let all_rows: Vec<Vec<Value>> = engine.storage().rows(&table)?.cloned().collect();
             
-            // WHERE条件でフィルタリング
+            // Filter rows based on WHERE condition
             let filtered_rows = if let Some(predicate) = filter {
                 all_rows.into_iter()
                     .filter(|row| evaluate_predicate(&predicate, row, &schema))
@@ -67,7 +67,7 @@ fn parse_value(raw: &str, ty: &ColumnType) -> Result<Value, String> {
 fn evaluate_predicate(predicate: &Predicate, row: &[Value], schema: &[crate::ast::ColumnDef]) -> bool {
     match predicate {
         Predicate::Cmp { col, op, val } => {
-            // 列名からインデックスを取得
+            // Get column index from column name
             if let Some(col_idx) = schema.iter().position(|c| &c.name == col) {
                 if let Some(row_val) = row.get(col_idx) {
                     return evaluate_comparison(row_val, op, val);
@@ -105,8 +105,8 @@ fn evaluate_comparison(left: &Value, op: &CmpOp, right: &Value) -> bool {
         (Value::Bool(l), Value::Bool(r)) => match op {
             CmpOp::Eq => l == r,
             CmpOp::Ne => l != r,
-            _ => false, // ブール値の大小比較は無効
+            _ => false, // Size comparison is invalid for boolean values
         },
-        _ => false, // 型が異なる場合は比較できない
+        _ => false, // Cannot compare values of different types
     }
 }

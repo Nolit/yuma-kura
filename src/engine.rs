@@ -1,14 +1,14 @@
 // src/engine.rs
 pub mod value;
 pub mod table;
-mod executor; // 実働部隊
+mod executor; // Core execution engine
 
-pub use executor::{QueryResult}; // 外に見せたい結果型だけ再公開
+pub use executor::{QueryResult}; // Re-export only the result type for external use
 
 use crate::ast::Stmt;
 use crate::storage::{Storage, mem::MemStorage};
 
-/// 外から使う唯一の窓口
+/// The only interface for external use
 pub struct Engine {
     storage: Box<dyn Storage>,
 }
@@ -20,12 +20,12 @@ impl Engine {
         }
     }
 
-    /// ASTを受けて実行はexecutorへ委譲
+    /// Delegates execution to executor after receiving AST
     pub fn execute(&mut self, stmt: Stmt) -> Result<QueryResult, String> {
         executor::execute(self, stmt)
     }
 
-    // executor から内部状態に触らせるための限定公開アクセサ
+    // Limited public accessors for executor to access internal state
     pub(crate) fn storage(&self) -> &dyn Storage { self.storage.as_ref() }
     pub(crate) fn storage_mut(&mut self) -> &mut dyn Storage { self.storage.as_mut() }
 }
