@@ -6,7 +6,7 @@ mod executor; // Core execution engine
 pub use executor::{QueryResult}; // Re-export only the result type for external use
 
 use crate::ast::Stmt;
-use crate::storage::{Storage, mem::MemStorage};
+use crate::storage::{Storage, StorageType, mem::MemStorage};
 
 /// The only interface for external use
 pub struct Engine {
@@ -14,10 +14,29 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new() -> Self {
-        Self { 
-            storage: Box::new(MemStorage::default())
-        }
+    /// Create a new engine with the specified storage type
+    pub fn new(storage_type: StorageType) -> Self {
+        let storage: Box<dyn Storage> = match storage_type {
+            StorageType::Memory => Box::new(MemStorage::default()),
+            StorageType::Csv(_path) => {
+                // TODO: Implement CSV storage
+                eprintln!("Warning: CSV storage not yet implemented, falling back to memory");
+                Box::new(MemStorage::default())
+            },
+            StorageType::Paged(_path) => {
+                // TODO: Implement paged storage
+                eprintln!("Warning: Paged storage not yet implemented, falling back to memory");
+                Box::new(MemStorage::default())
+            },
+        };
+        
+        Self { storage }
+    }
+
+    /// Create a new engine with default memory storage
+    #[allow(dead_code)]
+    pub fn new_memory() -> Self {
+        Self::new(StorageType::Memory)
     }
 
     /// Delegates execution to executor after receiving AST

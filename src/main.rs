@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::env;
 
 mod ast;
 pub mod parser;
@@ -7,10 +8,19 @@ use ast::{Command, MetaCmd};
 mod engine;
 use engine::{Engine, QueryResult};
 mod storage;
+use storage::StorageType;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let storage_type = args.get(2).map(|s| s.as_str()).unwrap_or("mem");
+    
     let user_name = "yuma";
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(StorageType::from_arg(storage_type));
+    
+    println!("Yuma-Kura Database Engine");
+    println!("Storage: {:?}", StorageType::from_arg(storage_type));
+    println!("Type .help for available commands");
+    
     loop {
         print!("{}>", user_name);
         io::stdout().flush().unwrap();
@@ -32,6 +42,12 @@ fn main() {
                 println!("  .help - Show this help");
                 println!("  SELECT * FROM <table> - Select all from table");
                 println!("  INSERT INTO <table> VALUES (...) - Insert values into table");
+                println!("  CREATE TABLE <table> (<columns>) - Create a new table");
+                println!();
+                println!("Storage options:");
+                println!("  mem - In-memory storage (default)");
+                println!("  csv:<file> - CSV file storage (future)");
+                println!("  paged:<file> - 4KB paged storage (future)");
             }
             Ok(Command::Sql(stmt)) => {
                 println!("SQL Statement: {:?}", stmt);
