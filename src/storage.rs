@@ -47,6 +47,20 @@ pub trait Storage {
     /// Returns an iterator over rows by reference (boxed for future extensibility)
     fn rows<'a>(&'a self, table: &str)
         -> Result<Box<dyn Iterator<Item = &'a Row> + 'a>, String>;
+
+    /// Get all rows as owned values (for CSV storage compatibility)
+    fn get_all_rows(&self, table: &str) -> Result<Vec<Row>, String> {
+        // Default implementation for memory storage
+        let iter = self.rows(table)?;
+        Ok(iter.cloned().collect())
+    }
+
+    /// Get streaming iterator over rows (for CSV storage)
+    fn rows_streaming(&self, table: &str) -> Result<Box<dyn Iterator<Item = Result<Row, String>> + Send>, String> {
+        // Default implementation falls back to get_all_rows
+        let rows = self.get_all_rows(table)?;
+        Ok(Box::new(rows.into_iter().map(Ok)))
+    }
 }
 
 pub mod mem;

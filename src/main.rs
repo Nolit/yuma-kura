@@ -12,13 +12,20 @@ use storage::StorageType;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let storage_type = args.get(2).map(|s| s.as_str()).unwrap_or("mem");
+    let storage_type = args.get(1).map(|s| s.as_str()).unwrap_or("mem");
+    let storage_type_enum = StorageType::from_arg(storage_type);
     
     let user_name = "yuma";
-    let mut engine = Engine::new(StorageType::from_arg(storage_type));
+    let mut engine = match Engine::new(storage_type_enum.clone()) {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("Failed to initialize engine: {}", e);
+            return;
+        }
+    };
     
     println!("Yuma-Kura Database Engine");
-    println!("Storage: {:?}", StorageType::from_arg(storage_type));
+    println!("Storage: {:?}", storage_type_enum);
     println!("Type .help for available commands");
     
     loop {
@@ -48,7 +55,7 @@ fn main() {
                 println!();
                 println!("Storage options:");
                 println!("  mem - In-memory storage (default)");
-                println!("  csv:<file> - CSV file storage (future)");
+                println!("  csv:<path> - CSV file storage");
                 println!("  paged:<file> - 4KB paged storage (future)");
             }
             Ok(Command::Sql(stmt)) => {

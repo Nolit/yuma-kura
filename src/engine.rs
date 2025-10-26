@@ -6,7 +6,7 @@ mod executor; // Core execution engine
 pub use executor::{QueryResult}; // Re-export only the result type for external use
 
 use crate::ast::Stmt;
-use crate::storage::{Storage, StorageType, mem::MemStorage};
+use crate::storage::{Storage, StorageType, mem::MemStorage, csv::CsvStorage};
 
 /// The only interface for external use
 pub struct Engine {
@@ -15,13 +15,17 @@ pub struct Engine {
 
 impl Engine {
     /// Create a new engine with the specified storage type
-    pub fn new(storage_type: StorageType) -> Self {
+    pub fn new(storage_type: StorageType) -> Result<Self, String> {
         let storage: Box<dyn Storage> = match storage_type {
             StorageType::Memory => Box::new(MemStorage::default()),
-            StorageType::Csv(_path) => {
-                // TODO: Implement CSV storage
-                eprintln!("Warning: CSV storage not yet implemented, falling back to memory");
-                Box::new(MemStorage::default())
+            StorageType::Csv(path) => {
+                match CsvStorage::new(path) {
+                    Ok(csv_storage) => Box::new(csv_storage),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize CSV storage: {}, falling back to memory", e);
+                        Box::new(MemStorage::default())
+                    }
+                }
             },
             StorageType::Paged(_path) => {
                 // TODO: Implement paged storage
@@ -30,12 +34,12 @@ impl Engine {
             },
         };
         
-        Self { storage }
+        Ok(Self { storage })
     }
 
     /// Create a new engine with default memory storage
     #[allow(dead_code)]
-    pub fn new_memory() -> Self {
+    pub fn new_memory() -> Result<Self, String> {
         Self::new(StorageType::Memory)
     }
 

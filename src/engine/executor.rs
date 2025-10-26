@@ -35,18 +35,27 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
         Stmt::Select { table, columns: _, filter } => {
             let schema = engine.storage().schema(&table)?;
             let cols = schema.iter().map(|c| c.name.clone()).collect();
-            let all_rows: Vec<Vec<Value>> = engine.storage().rows(&table)?.cloned().collect();
             
-            // Filter rows based on WHERE condition
-            let filtered_rows = if let Some(predicate) = filter {
-                all_rows.into_iter()
-                    .filter(|row| evaluate_predicate(&predicate, row, &schema))
-                    .collect()
-            } else {
-                all_rows
-            };
+            // Use streaming iterator for better memory efficiency
+            let mut all_rows = Vec::new();
+            let mut streaming_iter = engine.storage().rows_streaming(&table)?;
             
-            Ok(QueryResult::Rows { columns: cols, rows: filtered_rows })
+            while let Some(row_result) = streaming_iter.next() {
+                let row = row_result?;
+                
+                // Apply filter if specified
+                let matches = if let Some(ref predicate) = filter {
+                    evaluate_predicate(predicate, &row, &schema)
+                } else {
+                    true
+                };
+                
+                if matches {
+                    all_rows.push(row);
+                }
+            }
+            
+            Ok(QueryResult::Rows { columns: cols, rows: all_rows })
         }
         Stmt::Update { table, assignments, filter } => {
             let _updated_count = engine.storage_mut().update_rows(&table, &assignments, filter.as_ref())?;
@@ -59,6 +68,7 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
         }
     }
 }
+
 
 fn parse_value(raw: &str, ty: &ColumnType) -> Result<Value, String> {
     match ty {

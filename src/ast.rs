@@ -1,13 +1,14 @@
 use crate::engine::value::Value;
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ColumnType {
     Int,
     Text,
     Bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: ColumnType,
