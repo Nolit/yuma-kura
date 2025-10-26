@@ -43,6 +43,7 @@ fn main() {
                 println!("  SELECT * FROM <table> - Select all from table");
                 println!("  INSERT INTO <table> VALUES (...) - Insert values into table");
                 println!("  CREATE TABLE <table> (<columns>) - Create a new table");
+                println!("  UPDATE <table> SET <column>=<value> WHERE <condition> - Update rows in table");
                 println!();
                 println!("Storage options:");
                 println!("  mem - In-memory storage (default)");

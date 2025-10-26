@@ -18,6 +18,7 @@ pub enum Stmt {
     Select {table: String, columns: Projection, filter: Option<Predicate>},
     InsertValues {table: String, values: Vec<String>},
     CreateTable {table: String, columns: Vec<ColumnDef>},
+    Update {table: String, assignments: Vec<Assignment>, filter: Option<Predicate>},
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,12 @@ pub enum Predicate {
     Cmp { col: String, op: CmpOp, val: Value },
     And(Box<Predicate>, Box<Predicate>),
     Or(Box<Predicate>, Box<Predicate>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Assignment {
+    pub column: String,
+    pub value: String,
 }
 
 // Strictly speaking, this is not a SQL AST, so it might be separated later

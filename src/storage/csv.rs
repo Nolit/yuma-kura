@@ -1,7 +1,7 @@
 // src/storage/csv.rs
 // CSV file storage with .idx (index) and .del (deleted records) support
 
-use crate::ast::ColumnDef;
+use crate::ast::{ColumnDef, Assignment, Predicate};
 use crate::engine::value::Value;
 use super::{Storage, Row};
 use std::collections::HashMap;
@@ -198,6 +198,15 @@ impl Storage for CsvStorage {
         // TODO: Return iterator over CSV rows (excluding deleted)
         // This would need to be implemented differently for CSV since we can't return references
         // to data that's not in memory
+        Err("CSV storage not yet implemented".to_string())
+    }
+
+    fn update_rows(&mut self, _table: &str, _assignments: &[Assignment], _filter: Option<&Predicate>) -> Result<usize, String> {
+        // TODO: Implement CSV row updates
+        // 1. Read all rows from CSV file
+        // 2. Apply updates to matching rows
+        // 3. Write updated rows back to CSV file
+        // 4. Update index file if needed
         Err("CSV storage not yet implemented".to_string())
     }
 }

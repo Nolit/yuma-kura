@@ -32,7 +32,7 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
             engine.storage_mut().insert_row(&table, parsed)?;
             Ok(QueryResult::Acknowledged)
         }
-        Stmt::Select { table, columns, filter } => {
+        Stmt::Select { table, columns: _, filter } => {
             let schema = engine.storage().schema(&table)?;
             let cols = schema.iter().map(|c| c.name.clone()).collect();
             let all_rows: Vec<Vec<Value>> = engine.storage().rows(&table)?.cloned().collect();
@@ -47,6 +47,10 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
             };
             
             Ok(QueryResult::Rows { columns: cols, rows: filtered_rows })
+        }
+        Stmt::Update { table, assignments, filter } => {
+            let _updated_count = engine.storage_mut().update_rows(&table, &assignments, filter.as_ref())?;
+            Ok(QueryResult::Acknowledged)
         }
     }
 }
