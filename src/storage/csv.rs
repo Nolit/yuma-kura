@@ -209,4 +209,13 @@ impl Storage for CsvStorage {
         // 4. Update index file if needed
         Err("CSV storage not yet implemented".to_string())
     }
+
+    fn delete_rows(&mut self, _table: &str, _filter: Option<&Predicate>) -> Result<usize, String> {
+        // TODO: Implement CSV row deletion
+        // 1. Read all rows from CSV file
+        // 2. Filter rows based on WHERE condition
+        // 3. Mark matching rows as deleted in .del file
+        // 4. Update index file if needed
+        Err("CSV storage not yet implemented".to_string())
+    }
 }

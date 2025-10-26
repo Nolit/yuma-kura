@@ -44,6 +44,7 @@ fn main() {
                 println!("  INSERT INTO <table> VALUES (...) - Insert values into table");
                 println!("  CREATE TABLE <table> (<columns>) - Create a new table");
                 println!("  UPDATE <table> SET <column>=<value> WHERE <condition> - Update rows in table");
+                println!("  DELETE FROM <table> WHERE <condition> - Delete rows from table");
                 println!();
                 println!("Storage options:");
                 println!("  mem - In-memory storage (default)");

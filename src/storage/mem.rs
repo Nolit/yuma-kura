@@ -73,6 +73,31 @@ impl Storage for MemStorage {
         Ok(updated_count)
     }
 
+    fn delete_rows(&mut self, table: &str, filter: Option<&Predicate>) -> Result<usize, String> {
+        let key = table.to_lowercase();
+        let t = self.tables.get_mut(&key).ok_or("table not found")?;
+        
+        let mut deleted_count = 0;
+        
+        // Filter rows to keep (those that don't match the condition)
+        t.rows.retain(|row| {
+            let matches = if let Some(predicate) = filter {
+                evaluate_predicate(predicate, row, &t.schema)
+            } else {
+                true // No filter means delete all rows
+            };
+            
+            if matches {
+                deleted_count += 1;
+                false // Remove this row
+            } else {
+                true // Keep this row
+            }
+        });
+        
+        Ok(deleted_count)
+    }
+
     fn rows<'a>(&'a self, table: &str)
         -> Result<Box<dyn Iterator<Item = &'a Row> + 'a>, String>
     {

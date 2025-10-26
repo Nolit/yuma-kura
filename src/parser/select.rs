@@ -22,7 +22,7 @@ pub fn parse_select_all(s: &str) -> Result<Stmt, String> {
     
     let table = tokens[3].trim_matches('"').to_string();
     
-    // WHERE句の解析
+    // Parse WHERE clause
     let filter = if tokens.len() > 4 && tokens[4].eq_ignore_ascii_case("where") {
         parse_where_clause(&tokens[5..])?
     } else {
@@ -41,7 +41,7 @@ fn parse_where_clause(tokens: &[&str]) -> Result<Option<Predicate>, String> {
         return Err("WHERE clause is empty".into());
     }
     
-    // 簡単な比較条件のみサポート: column op value
+    // Support simple comparison conditions only: column op value
     if tokens.len() >= 3 {
         let col = tokens[0].to_string();
         let op = parse_cmp_op(tokens[1])?;
@@ -68,18 +68,18 @@ fn parse_cmp_op(op: &str) -> Result<CmpOp, String> {
 fn parse_value(s: &str) -> Result<Value, String> {
     let s = s.trim_matches('"');
     
-    // 整数
+    // Integer
     if let Ok(i) = s.parse::<i64>() {
         return Ok(Value::Int(i));
     }
     
-    // ブール値
+    // Boolean value
     match s.to_lowercase().as_str() {
         "true" | "1" => return Ok(Value::Bool(true)),
         "false" | "0" => return Ok(Value::Bool(false)),
         _ => {}
     }
     
-    // 文字列
+    // String
     Ok(Value::Text(s.to_string()))
 }

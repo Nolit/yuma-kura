@@ -52,6 +52,11 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
             let _updated_count = engine.storage_mut().update_rows(&table, &assignments, filter.as_ref())?;
             Ok(QueryResult::Acknowledged)
         }
+        Stmt::Delete { table, filter } => {
+            let deleted_count = engine.storage_mut().delete_rows(&table, filter.as_ref())?;
+            println!("Deleted {} rows", deleted_count);
+            Ok(QueryResult::Acknowledged)
+        }
     }
 }
 

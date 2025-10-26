@@ -39,6 +39,7 @@ pub trait Storage {
     fn create_table(&mut self, name: &str, schema: Vec<ColumnDef>) -> Result<(), String>;
     fn insert_row(&mut self, table: &str, row: Row) -> Result<(), String>;
     fn update_rows(&mut self, table: &str, assignments: &[crate::ast::Assignment], filter: Option<&crate::ast::Predicate>) -> Result<usize, String>;
+    fn delete_rows(&mut self, table: &str, filter: Option<&crate::ast::Predicate>) -> Result<usize, String>;
 
     /// Returns table schema as a read-only slice
     fn schema(&self, table: &str) -> Result<&[ColumnDef], String>;

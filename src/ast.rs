@@ -19,6 +19,7 @@ pub enum Stmt {
     InsertValues {table: String, values: Vec<String>},
     CreateTable {table: String, columns: Vec<ColumnDef>},
     Update {table: String, assignments: Vec<Assignment>, filter: Option<Predicate>},
+    Delete {table: String, filter: Option<Predicate>},
 }
 
 #[derive(Debug, Clone)]

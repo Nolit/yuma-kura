@@ -49,4 +49,13 @@ impl Storage for PagedStorage {
         // 3. Write updated pages back to disk
         Err("Paged storage not yet implemented".to_string())
     }
+
+    fn delete_rows(&mut self, _table: &str, _filter: Option<&Predicate>) -> Result<usize, String> {
+        // TODO: Implement paged row deletion
+        // 1. Read relevant pages from disk
+        // 2. Filter rows based on WHERE condition
+        // 3. Mark matching rows as deleted in page metadata
+        // 4. Write updated pages back to disk
+        Err("Paged storage not yet implemented".to_string())
+    }
 }
