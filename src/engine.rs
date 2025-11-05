@@ -6,7 +6,7 @@ mod executor; // Core execution engine
 pub use executor::{QueryResult}; // Re-export only the result type for external use
 
 use crate::ast::Stmt;
-use crate::storage::{Storage, StorageType, mem::MemStorage, csv::CsvStorage};
+use crate::storage::{Storage, StorageType, mem::MemStorage, csv::CsvStorage, paged::PagedStorage};
 
 /// The only interface for external use
 pub struct Engine {
@@ -27,10 +27,14 @@ impl Engine {
                     }
                 }
             },
-            StorageType::Paged(_path) => {
-                // TODO: Implement paged storage
-                eprintln!("Warning: Paged storage not yet implemented, falling back to memory");
-                Box::new(MemStorage::default())
+            StorageType::Paged(path) => {
+                match PagedStorage::new(path) {
+                    Ok(paged_storage) => Box::new(paged_storage),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to initialize Paged storage: {}, falling back to memory", e);
+                        Box::new(MemStorage::default())
+                    }
+                }
             },
         };
         
