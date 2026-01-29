@@ -105,13 +105,23 @@ In the following sections, we will use a 4KB fixed-size page as an example and e
 |                                                  |
 | Row Data                                        |
 | +----------------------+                        |
-| | Row Header | Data    |  <- offset 3200        |
+| | Row Header | Data    |  <- offset 2600        |
 | +----------------------+                        |
 | | Row Header | Data    |  <- offset 3000        |
 | +----------------------+                        |
-| | Row Header | Data    |  <- offset 2600        |
+| | Row Header | Data    |  <- offset 3200        |
 | +----------------------+                        |
 +--------------------------------------------------+
+
+Row
++----------------------------------+
+| Row Header                       |
+|  - total_length                  |
+|  - flags (deleted, moved, etc)   |
++----------------------------------+
+| User Data (payload)              |
++----------------------------------+
+
 ```
 
 
@@ -119,7 +129,44 @@ In the following sections, we will use a 4KB fixed-size page as an example and e
 
 ### Inserting a Row into a Page
 
-Using this page layout, insertion proceeds as follows:
+
+ここに100バイトのでーたを入れるケースを考えてみます。
+挿入後のページデータは以下のようになります。
+
+```
+Before (Insert前)                                  After (Insert後)
+4KB Page                                          4KB Page
++--------------------------------------------------+      +--------------------------------------------------+
+| Page Header                                      |      | Page Header                                      |
+|  - Page ID                                      |      |  - Page ID                                      |
+|  - Free Space Offset  -> 2600                   |  ==> |  - Free Space Offset  -> 2500                   |
+|  - Slot Count                                   |      |  - Slot Count                                   |
++--------------------------------------------------+      +--------------------------------------------------+
+| Slot Directory                                  |      | Slot Directory                                  |
+|--------------------------------------------------|      |--------------------------------------------------|
+| Slot 0 -> offset 3200                           |      | Slot 0 -> offset 3200                           |
+| Slot 1 -> offset 3000                           |      | Slot 1 -> offset 3000                           |
+| Slot 2 -> FREE                                 |      | Slot 2 -> offset 2500                           |
+| Slot 3 -> offset 2600                           |      | Slot 3 -> offset 2600                           |
++--------------------------------------------------+      +--------------------------------------------------+
+|                                                  |      |                                                  |
+|               (free space)                       |      |               (free space)                       |
+|                                                  |      |                                                  |
+| Row Data                                        |      | Row Data                                        |
+| +----------------------+                        |      | +----------------------+                        |
+| | Row Header | Data    |  <- offset 2600        |      | | Row Header | Data    |  <- offset 2500        |
+| +----------------------+                        |      | +----------------------+                        |
+| | Row Header | Data    |  <- offset 3000        |      | | Row Header | Data    |  <- offset 2600        |
+| +----------------------+                        |      | +----------------------+                        |
+| | Row Header | Data    |  <- offset 3200        |      | | Row Header | Data    |  <- offset 3000        |
+| +----------------------+                        |      | +----------------------+                        |
+|                                                  |      | | Row Header | Data    |  <- offset 3200        |
+|                                                  |      | +----------------------+                        |
++--------------------------------------------------+      +--------------------------------------------------+
+
+```
+
+Insertion proceeds as follows:
 
 1. Since the Free Space Offset is 2600, new row data must be placed before this boundary  
 2. If the row size is 100 bytes, the new row starts at `2600 - 100 = 2500`  
@@ -129,9 +176,115 @@ Using this page layout, insertion proceeds as follows:
 
 Because the Slot Directory grows from the beginning of the page, row data is placed from the end of the page toward the front.  
 This structure allows variable-length records to be inserted while keeping the operation confined within a single page.
+これはあくまで4KBの一つのページ内の話であり、データが追加されていき4KBを超えれば次のページが作られることとなる。
 
+```
+[ existing pages ][ page 40 ][ page 41 ][ page 42 ]
+                                             ↑
+                                       newly appended
+```
+
+ちなみに挿入先ページの探索だが、本来であればメタ情報として各ページの空き容量を保持するが現在は頭からページを読み込んでいる。挿入毎にO(N)の計算量が必要となるのでもちろん効率は良くない
+
+## 更新の場合
+先ほどのページを例に次は更新処理を見ていきたい
+
+```
+4KB Page
++--------------------------------------------------+
+| Page Header                                      |
+|  - Page ID                                      |
+|  - Free Space Offset  -> 2600                   |
+|  - Slot Count                                   |
++--------------------------------------------------+
+| Slot Directory                                  |
+|--------------------------------------------------|
+| Slot 0 -> offset 3200                           |
+| Slot 1 -> offset 3000                           |
+| Slot 2 -> FREE                                 |
+| Slot 3 -> offset 2600                           |
++--------------------------------------------------+
+|                                                  |
+|               (free space)                       |
+|                                                  |
+| Row Data                                        |
+| +----------------------+                        |
+| | Row Header | Data    |  <- offset 2600        |
+| +----------------------+                        |
+| | Row Header | Data    |  <- offset 3000        |
+| +----------------------+                        |
+| | Row Header | Data    |  <- offset 3200        |
+| +----------------------+                        |
++--------------------------------------------------+
+```
+
+ここではSlot1のデータを変更するとする。データのオフセットを見るにSlot1のデータ量は3200-3000=200バイトなのだが変更後に100バイトに減るとする
+サイズが減る場合は変更後の100バイトを書き込み、Row Headerを変えるだけで良く他のページはおろか他のRowにも影響を与えない。
+
+```
+Before (slot1: 200B)                                After (slot1: 100B)
+offset = 3000                                       offset = 3000
++------------------------------------------------+  +------------------------------------------------+
+| Row Header                                     |  | Row Header                                     |
+|  - row_length = 200                            |  |  - row_length = 100                            |
+|  - flags = 0                                   |  |  - flags = 0                                   |
++------------------------------------------------+  +------------------------------------------------+
+| Payload (200B)                                 |  | Payload (100B)                                 |
+|  [............................................] |  |  [....................]                        |
+|  [............................................] |  |                                                 |
++------------------------------------------------+  +------------------------------------------------+
+                                                   |  +------------------------------------------------+
+                                                   |  | Unused / Padding (100B)                        |
+                                                   |  |  [............................................] |
+                                                   |  +------------------------------------------------+
+
+```
+
+Slot1のデータサイズを400Bに増やす場合で考えてみる。
+この場合、元の位置に400Bを書き込むと次のslot0を上書きしてしまうので、slot1が400B空いているスペースを指す必要がある
+
+```
+Before (slot1: 200B at 3000)                         After (slot1: 400B moved, dead space at 3000-3200)
+4KB Page                                             4KB Page
++--------------------------------------------------+  +--------------------------------------------------+
+| Page Header                                      |  | Page Header                                      |
+|  - Page ID                                      |  |  - Page ID                                      |
+|  - Free Space Offset  -> 2600                   |  |  - Free Space Offset  -> 2200                   |
+|  - Slot Count                                   |  |  - Slot Count                                   |
++--------------------------------------------------+  +--------------------------------------------------+
+| Slot Directory                                  |  | Slot Directory                                  |
+|--------------------------------------------------|  |--------------------------------------------------|
+| Slot 0 -> offset 3200                           |  | Slot 0 -> offset 3200                           |
+| Slot 1 -> offset 3000                           |  | Slot 1 -> offset 2200   (UPDATED)               |
+| Slot 2 -> FREE                                 |  | Slot 2 -> FREE                                 |
+| Slot 3 -> offset 2600                           |  | Slot 3 -> offset 2600                           |
++--------------------------------------------------+  +--------------------------------------------------+
+|                                                  |  |                                                  |
+|               (free space)                       |  |               (free space)                       |
+|                                                  |  |                                                  |
+| Row Data                                        |  | Row Data                                        |
+| +----------------------+                        |  | +----------------------+                        |
+| | Row Header | Data    |  <- offset 2600        |  | | Row Header | Data    |  <- offset 2200        |
+| +----------------------+                        |  | |   (slot1, 400B NEW)  |                        |
+| | Row Header | Data    |  <- offset 3000        |  | +----------------------+                        |
+| |   (slot1 old, 200B)  |                        |  | | Row Header | Data    |  <- offset 2600        |
+| +----------------------+                        |  | +----------------------+                        |
+| | Row Header | Data    |  <- offset 3200        |  | | (dead space: 3000–3200)                        |
+| +----------------------+                        |  | +----------------------+                        |
+|                                                  |  | | Row Header | Data    |  <- offset 3200        |
++--------------------------------------------------+  +--------------------------------------------------+
+
+```
+
+ここでCSVのケースと違いを意識したいのが、CSVの場合はファイルのそれ以降の全データに影響を与えたが、今回は変更が1つのページ内に閉じている点である。
+dead spaceについては特定のタイミングでまとめられると想像するがまだその実装はできていない。
+
+## 削除の場合
+TODO
+- Row Headerのフラグを立てる or slotをFreeにしたら良さそう
 
 ## Questions
 - What advantages does a fixed-size page provide? (I/O efficiency, caching, allocation, concurrency, WAL, ...)
 - Why 4KB / 8KB specifically? (OS page size, filesystem blocks, trade-offs)
+
 
