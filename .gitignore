@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Test data
+/testdata/
+
 # VSCode / Cursor
 .vscode/
 .cursor/
