@@ -113,7 +113,7 @@ struct RowHeader {
 }
 
 impl RowHeader {
-    const SIZE: usize = 16; // row_id(4) + data_size(2) + deleted(1) + overflow(1) + next_page(4) + toast_id(8)
+    const SIZE: usize = 20; // row_id(4) + data_size(2) + deleted(1) + overflow(1) + next_page(4) + toast_id(8)
     
     fn new(row_id: u32, data_size: u16) -> Self {
         Self {
