@@ -1,5 +1,6 @@
-use std::io::{self, Write};
 use std::env;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 
 mod ast;
 pub mod parser;
@@ -9,6 +10,8 @@ mod engine;
 use engine::{Engine, QueryResult};
 mod storage;
 use storage::StorageType;
+
+const HISTORY_FILE: &str = ".yumakura_history";
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -28,15 +31,34 @@ fn main() {
     println!("Storage: {:?}", storage_type_enum);
     println!("Type .help for available commands");
     
+    let mut rl = match DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("Failed to initialize line editor: {}", e);
+            return;
+        }
+    };
+    // 履歴ファイルが無い初回起動時はエラーになるが問題ないので無視する
+    let _ = rl.load_history(HISTORY_FILE);
+
     loop {
-        print!("{}>", user_name);
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-
-        io::stdin().read_line(&mut input).expect("Failed to read line");
+        let input = match rl.readline(&format!("{}>", user_name)) {
+            Ok(input) => input,
+            // Ctrl+C: 入力中の行を破棄して続行
+            Err(ReadlineError::Interrupted) => continue,
+            // Ctrl+D / 入力終了
+            Err(ReadlineError::Eof) => {
+                println!("Bye!");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Failed to read line: {}", e);
+                break;
+            }
+        };
         let line = input.trim();
         if line.is_empty() { continue; }
+        let _ = rl.add_history_entry(line);
 
         match parse_command(line) {
             Ok(Command::Meta(MetaCmd::Exit)) => {
@@ -75,6 +97,10 @@ fn main() {
                 eprintln!("Error: {}", e);
             }
         }
+    }
+
+    if let Err(e) = rl.save_history(HISTORY_FILE) {
+        eprintln!("Failed to save history: {}", e);
     }
 }
 

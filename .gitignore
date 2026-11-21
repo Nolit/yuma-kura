@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# REPL history
+.yumakura_history
+
 # Test data
 /testdata/
 
