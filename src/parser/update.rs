@@ -44,7 +44,8 @@ pub fn parse_update(input: &str) -> PResult<Stmt> {
             return Err(ParseError::Message("Expected value after =".to_string()));
         }
         
-        let value = tokens[i].to_string();
+        // Strip surrounding quotes, consistent with INSERT value parsing
+        let value = tokens[i].trim_matches('\'').trim_matches('"').to_string();
         i += 1;
 
         assignments.push(Assignment { column, value });
@@ -115,4 +116,26 @@ fn parse_where_clause(tokens: &[&str], i: &mut usize) -> PResult<Predicate> {
     };
 
     Ok(Predicate::Cmp { col: column, op, val: value })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_value(sql: &str) -> String {
+        match parse_update(sql).unwrap() {
+            Stmt::Update { assignments, .. } => assignments[0].value.clone(),
+            _ => panic!("expected UPDATE"),
+        }
+    }
+
+    #[test]
+    fn strips_double_quotes_from_value() {
+        assert_eq!(first_value(r#"update t set name = "def" where id = 1"#), "def");
+    }
+
+    #[test]
+    fn strips_single_quotes_from_value() {
+        assert_eq!(first_value("update t set name = 'def' where id = 1"), "def");
+    }
 }

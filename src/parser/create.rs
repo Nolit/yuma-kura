@@ -19,6 +19,9 @@ pub fn parse_create_table(s: &str) -> Result<Stmt, String> {
         if part.is_empty() { continue; }
         let mut it = part.split_whitespace();
         let col_name = it.next().ok_or("column name expected")?.trim_matches('"').to_string();
+        if !is_valid_identifier(&col_name) {
+            return Err(format!("invalid column name: {col_name:?} (use letters, digits and '_', e.g. `id INT`)"));
+        }
         let ty_tok = it.next().ok_or("column type expected (e.g., INT, TEXT, BOOL)")?;
         let data_type = match_ty(ty_tok)?;
         columns.push(ColumnDef { name: col_name, data_type });
@@ -28,6 +31,15 @@ pub fn parse_create_table(s: &str) -> Result<Stmt, String> {
     Ok(Stmt::CreateTable { table: name, columns })
 }
 
+fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn match_ty(tok: &str) -> Result<ColumnType, String> {
     let t = tok.to_lowercase();
     match t.as_str() {
@@ -35,5 +47,25 @@ fn match_ty(tok: &str) -> Result<ColumnType, String> {
         "text" | "string" | "varchar" => Ok(ColumnType::Text),
         "bool" | "boolean" => Ok(ColumnType::Bool),
         _ => Err(format!("unsupported type: {tok}")),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_column_name_with_colon() {
+        assert!(parse_create_table("CREATE TABLE t (id: INT, name: TEXT)").is_err());
+    }
+
+    #[test]
+    fn accepts_plain_column_names() {
+        match parse_create_table("CREATE TABLE t (id INT, name TEXT)").unwrap() {
+            Stmt::CreateTable { columns, .. } => {
+                let names: Vec<_> = columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(names, ["id", "name"]);
+            }
+            other => panic!("unexpected stmt: {other:?}"),
+        }
     }
 }

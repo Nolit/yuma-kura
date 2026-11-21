@@ -58,7 +58,20 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
             Ok(QueryResult::Rows { columns: cols, rows: all_rows })
         }
         Stmt::Update { table, assignments, filter } => {
-            let _updated_count = engine.storage_mut().update_rows(&table, &assignments, filter.as_ref())?;
+            // Reject unknown columns instead of silently matching zero rows
+            {
+                let schema = engine.storage().schema(&table)?;
+                if let Some(ref predicate) = filter {
+                    check_predicate_columns(predicate, &schema)?;
+                }
+                for a in &assignments {
+                    if !schema.iter().any(|c| c.name == a.column) {
+                        return Err(format!("column '{}' not found in table '{}'", a.column, table));
+                    }
+                }
+            }
+            let updated_count = engine.storage_mut().update_rows(&table, &assignments, filter.as_ref())?;
+            println!("Updated {} rows", updated_count);
             Ok(QueryResult::Acknowledged)
         }
         Stmt::Delete { table, filter } => {
@@ -80,6 +93,22 @@ fn parse_value(raw: &str, ty: &ColumnType) -> Result<Value, String> {
             "false" | "0" => Ok(Value::Bool(false)),
             _ => Err(format!("expected BOOL, got {raw:?}")),
         },
+    }
+}
+
+fn check_predicate_columns(predicate: &Predicate, schema: &[crate::ast::ColumnDef]) -> Result<(), String> {
+    match predicate {
+        Predicate::Cmp { col, .. } => {
+            if schema.iter().any(|c| &c.name == col) {
+                Ok(())
+            } else {
+                Err(format!("column '{}' not found", col))
+            }
+        }
+        Predicate::And(l, r) | Predicate::Or(l, r) => {
+            check_predicate_columns(l, schema)?;
+            check_predicate_columns(r, schema)
+        }
     }
 }
 
