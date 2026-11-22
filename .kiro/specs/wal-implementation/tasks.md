@@ -25,13 +25,13 @@ pending_changesとWALログの仕様については `.kiro/specs/wal-implementat
 - [ ] `src/storage/wal.rs` を作成し、WALレコードのデータ構造（ヘッダ・ボディ。`FullPageWrite` / `CatalogWrite` / `Commit`）を定義する
 - [ ] `src/storage/wal.rs` にWALファイルへのappendロジックを実装する
   - LSNはレコードごとに+1採番する（初期値1）
-  - `FullPageWrite` の追記時は、そのレコードのLSNをページイメージのヘッダの `last_applied_lsn` に書き込んでから、チェックサム（CRC32）を計算する
+  - `FullPageWrite` の追記時は、そのレコードのLSNをページイメージのヘッダの `last_applied_lsn` に書き込んでから、チェックサム（CRC32）を計算する。LSNを設定したページイメージ（LSN設定済みページイメージ）は呼び出し元へ返し、`pages.dat` への書き込みにも同じバイト列を使えるようにする
   - 起動時にWALを読み、最後の有効なレコードのLSN+1から採番を再開する（WALが空なら1）
   - WALを先頭から読む処理は、`dump`、LSNの再開、ステップ3のRecoveryで共通に使えるよう、1つの読み込み処理（レコードを1件ずつ返すイテレータなど）として実装する。読み込みを止める条件は、`design.md` の「WALの読み込みを止める条件」に従う
 - [ ] `PagedStorage` に `wal: Wal` フィールドを追加する
 - [ ] `Storage` トレイトに `commit_changes(&[PendingChange])` を追加する。戻り値は、致命的エラーを通常のSQLエラーと区別できる `Result` とする（エラー型は実装時に決める）。`commit_changes` の中のエラー（WALのappend、fsync、実ファイルへの書き込み）は、すべて致命的エラーとして返す。「Commit中・Commit後の失敗時の扱い」を参照
 - [ ] `Storage` トレイトに `abort_changes()` を追加する。SQLが `commit_changes` を呼ぶ前に失敗したときに、そのSQLの未Commitの変更（一時マップと作業用カタログ）を破棄するために呼ぶ。メモリ上のものを捨てるだけなので、戻り値は持たない
-- [ ] `PagedStorage::commit_changes` で、PendingChangesを受け取った順に（`PageWrite` は `page_id` 順）WALにappendし、Commitレコードをappendしてfsyncする。fsync成功後（Commit確定後）に、作業用カタログを正式なカタログに置き換え、その後で `PageWrite` を `pages.dat` に、`CatalogWrite` を `catalog.json` に書き込む。書き込み後は、SQL実行中に使った一時マップを破棄する
+- [ ] `PagedStorage::commit_changes` で、PendingChangesを受け取った順に（`PageWrite` は `page_id` 順）WALにappendし、Commitレコードをappendしてfsyncする。fsync成功後（Commit確定後）に、作業用カタログを正式なカタログに置き換え、その後で `PageWrite` を `pages.dat` に、`CatalogWrite` を `catalog.json` に書き込む。`PageWrite` ごとに `page_data` を複製してLSNを設定し、WALへの書き込みと `pages.dat` への書き込みには、このLSN設定済みページイメージの同じバイト列を使う（`PendingChange` 自体は変更しない）。書き込み後は、SQL実行中に使った一時マップを破棄する
 - [ ] `MemStorage::commit_changes` / `CsvStorage::commit_changes` は no-op として実装する（insert_row / update_rows / delete_rows 時点で既に書き込み済みのため）
 - [ ] `PagedStorage::abort_changes` で、一時マップと作業用カタログを破棄する。正式なカタログとページファイルは変更しない。`MemStorage::abort_changes` / `CsvStorage::abort_changes` は no-op として実装する（呼び出し時点で実データへ書き込み済みのため、破棄できない。「バックエンドごとの差異」参照）
 - [ ] `executor.rs` で CREATE TABLE / INSERT / UPDATE / DELETE 実行後、TxId=1固定で `storage.commit_changes(&pending_changes)` を呼ぶ（auto commit）
@@ -50,6 +50,7 @@ pending_changesとWALログの仕様については `.kiro/specs/wal-implementat
 - 複数ページにまたがるINSERT / UPDATE / DELETE の後でも、全行が正しく読めること
 - 複数ページにまたがる操作が、1つのトランザクションとして `FullPageWrite` 複数件と `Commit` 1件でWALに記録されること
 - カタログが変わる操作では、`CatalogWrite` がWALに記録されること
+- Commit後、`pages.dat` の各ページの `last_applied_lsn` が、WALの対応する `FullPageWrite` のLSNと一致すること。あわせて、そのページのバイト列がWALの `page_data` と完全に一致すること
 - `cargo run -- dump-wal <path>` でWALレコードの内容（LSN・Type・checksum）が表示されること
 - チェックサムが正しく計算されていること（dump時にOK/NGが表示されること）
 - SQLが `commit_changes` の前に失敗した場合（例: 複数ページにまたがるUPDATEの途中でエラー）、`abort_changes` により、正式なカタログ、`pages.dat`、`catalog.json`、WALのいずれも変更されていないこと。失敗の直後に、同じテーブルへのINSERTとSELECTが成功すること
@@ -100,6 +101,7 @@ WALを先頭から順に読む処理は、ステップ1の `dump` とLSNの再�
 - Commit後、`pages.dat` と `catalog.json` への書き込み前の状態（WALだけが最新）から起動すると、全行が正しく読めること
 - 新しいページを作るINSERTの後、`pages.dat` が短い状態から起動すると、Recoveryでファイルが延び、全行が正しく読めること
 - `pages.dat` のページの一部が壊れている（torn page）状態でも、Recoveryで復旧し、全行が正しく読めること
+- Recoveryの後、書き戻されたページの `last_applied_lsn` が、WALの対応する `FullPageWrite` のLSNと一致し、ページのバイト列がWALの `page_data` と完全に一致すること
 - `catalog.json` が壊れていても、WALに `CatalogWrite` があれば、Recoveryで復旧して起動できること
 - `catalog.json` が壊れていて、WALに `CatalogWrite` がない場合は、起動が失敗し、MemStorageにフォールバックしないこと
 - WALがない、または空の場合は、`catalog.json` と `pages.dat` を変更せずに起動できること

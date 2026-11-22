@@ -295,7 +295,10 @@ Recoveryは、WALを先頭から順に読む。次のいずれかに当たった
 | `last_applied_lsn` | `u64` | このページに最後に適用されたWALレコードのLSN。0はWAL未適用を示す |
 
 - 現時点ではRecoveryでは参照しない。将来のスキップ判定用に予約する。
-- WALに `FullPageWrite` を追記するときは、そのレコードのLSNをページイメージの `last_applied_lsn` に書き込んでから、WALレコードのチェックサムを計算する。
+- Commit時、`PageWrite` ごとに `page_data` を複製し、そのレコードに採番したLSNを複製の `last_applied_lsn` に書き込む。これを「LSN設定済みページイメージ」と呼ぶ。
+- チェックサムの計算、WALへの `FullPageWrite` の書き込み、`pages.dat` への書き込みには、このLSN設定済みページイメージと同じバイト列を使う。WAL用と実データ用でイメージを別々に作らない。
+- 結果として、Commit後に `pages.dat` のページの `last_applied_lsn` は、WALの対応する `FullPageWrite` のLSNと一致する。
+- `PendingChange` 自体は変更しない（`commit_changes` は `&[PendingChange]` のまま）。LSNは採番時にしか決まらないため、複製への書き込みはCommit時に行う。
 - `PageHeader` は現在20バイト（`_reserved` 2バイトを含む）。`last_applied_lsn`（8バイト）の追加で `PAGE_HEADER_SIZE` は28バイトになる。
 
 ### 将来対応（時間があれば）

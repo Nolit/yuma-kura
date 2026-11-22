@@ -17,6 +17,7 @@ Acceptance Criteria:
 - commit時にPending ChangesをWALにappendする。1つのトランザクションの中で、同じページの `FullPageWrite` は1件だけとする
 - Commit recordをappendしてからfsyncを行う
 - fsync完了後に実データページへ反映する
+- 実データページへ反映するバイト列は、WALの `FullPageWrite` の `page_data` と同一とする。ページの `last_applied_lsn` には、その `FullPageWrite` のLSNを設定する
 
 ### REQ-2: Crash Recovery
 
@@ -73,6 +74,7 @@ Acceptance Criteria:
 - **CP-4 Idempotency**: Recoveryを何度続けて実行しても、`pages.dat`・`catalog.json`・WALの結果は同じになる（REQ-2）
 - **CP-5 LSN Monotonicity**: WAL内のレコードのLSNは、先頭から順に1ずつ増える。LSN 0はどのレコードにも割り当てられない（REQ-1）
 - **CP-6 One Image per Page**: 1つのトランザクションの中で、同じページの `FullPageWrite` は1件だけである（REQ-1）
+- **CP-7 WAL and Page Image Consistency**: Commit後に `pages.dat` へ書かれたページのバイト列は、WALの対応する `FullPageWrite` の `page_data` と一致する。したがって、ページの `last_applied_lsn` は、その `FullPageWrite` のLSNと等しい（REQ-1）
 
 ## Non-Goals
 
