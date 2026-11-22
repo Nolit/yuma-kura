@@ -588,11 +588,25 @@ impl PagedStorage {
                                 
                                 self.write_page(new_page_id, &new_page)?;
                                 
+                                // Append the new page to the end of the chain
+                                let tail_page_id = self.catalog.tables.get(table_name)
+                                    .ok_or("table not found")?
+                                    .last_page_id;
+                                if tail_page_id == page_id {
+                                    // Current page is the tail: update the in-memory copy
+                                    header.next_page = new_page_id;
+                                    page.as_mut_slice()[0..PAGE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+                                } else {
+                                    let mut tail_page = self.read_page(tail_page_id)?;
+                                    let mut tail_header = PageHeader::from_bytes(&tail_page.as_slice()[0..PAGE_HEADER_SIZE])?;
+                                    tail_header.next_page = new_page_id;
+                                    tail_page.as_mut_slice()[0..PAGE_HEADER_SIZE].copy_from_slice(&tail_header.to_bytes());
+                                    self.write_page(tail_page_id, &tail_page)?;
+                                }
+
                                 // Update table metadata to track new page
                                 if let Some(table_meta) = self.catalog.tables.get_mut(table_name) {
-                                    if new_page_id > table_meta.last_page_id {
-                                        table_meta.last_page_id = new_page_id;
-                                    }
+                                    table_meta.last_page_id = new_page_id;
                                 }
                                 
                                 updated_count += 1;
@@ -672,7 +686,17 @@ impl Storage for PagedStorage {
             Some(page_id) => page_id,
             None => {
                 // Create a new page
+                let prev_last_page_id = self.catalog.tables.get(&table_name)
+                    .ok_or("table not found")?
+                    .last_page_id;
                 let new_page_id = self.create_new_page()?;
+                
+                // Link the previous last page to the new page
+                let mut prev_page = self.read_page(prev_last_page_id)?;
+                let mut prev_header = PageHeader::from_bytes(&prev_page.as_slice()[0..PAGE_HEADER_SIZE])?;
+                prev_header.next_page = new_page_id;
+                prev_page.as_mut_slice()[0..PAGE_HEADER_SIZE].copy_from_slice(&prev_header.to_bytes());
+                self.write_page(prev_last_page_id, &prev_page)?;
                 
                 // Update metadata
                 if let Some(table_meta) = self.catalog.tables.get_mut(&table_name) {
@@ -717,13 +741,24 @@ impl Storage for PagedStorage {
             (table_meta.schema.clone(), table_meta.first_page_id, table_meta.last_page_id)
         };
         
-        // TODO: Traverse page chain
-        // Note: New pages created during update already contain updated rows,
-        // so we don't need to process them again
+        // Traverse page chain via next_page pointer.
+        // Stop at the tail as of the start of this update: pages appended during
+        // the update already contain updated rows and must not be processed again.
         let mut total_updated = 0;
-        for page_id in first_page_id..=last_page_id {
-            let updated = self.update_rows_in_page(&table_name, page_id, &schema, Some(assignments), filter)?;
+        let mut current_page_id = first_page_id;
+        loop {
+            let updated = self.update_rows_in_page(&table_name, current_page_id, &schema, Some(assignments), filter)?;
             total_updated += updated;
+
+            if current_page_id == last_page_id {
+                break;
+            }
+            let page = self.read_page(current_page_id)?;
+            let header = PageHeader::from_bytes(&page.as_slice()[0..PAGE_HEADER_SIZE])?;
+            if header.next_page == 0 {
+                break;
+            }
+            current_page_id = header.next_page;
         }
         
         // Save catalog if new pages were created (metadata updated)
@@ -734,17 +769,25 @@ impl Storage for PagedStorage {
     
     fn delete_rows(&mut self, table: &str, filter: Option<&Predicate>) -> Result<usize, String> {
         let table_name = table.to_lowercase();
-        let (schema, first_page_id, last_page_id) = {
+        let (schema, first_page_id) = {
             let table_meta = self.catalog.tables.get(&table_name)
                 .ok_or("table not found")?;
-            (table_meta.schema.clone(), table_meta.first_page_id, table_meta.last_page_id)
+            (table_meta.schema.clone(), table_meta.first_page_id)
         };
         
-        // TODO: Traverse page chain
+        // Traverse page chain via next_page pointer
         let mut total_deleted = 0;
-        for page_id in first_page_id..=last_page_id {
-            let deleted = self.update_rows_in_page(&table_name, page_id, &schema, None, filter)?;
+        let mut current_page_id = first_page_id;
+        loop {
+            let deleted = self.update_rows_in_page(&table_name, current_page_id, &schema, None, filter)?;
             total_deleted += deleted;
+
+            let page = self.read_page(current_page_id)?;
+            let header = PageHeader::from_bytes(&page.as_slice()[0..PAGE_HEADER_SIZE])?;
+            if header.next_page == 0 {
+                break;
+            }
+            current_page_id = header.next_page;
         }
         
         Ok(total_deleted)
@@ -767,7 +810,7 @@ impl Storage for PagedStorage {
         let mut all_rows = Vec::new();
         let mut current_page_id = table_meta.first_page_id;
         
-        while current_page_id <= table_meta.last_page_id {
+        loop {
             let offset = current_page_id as u64 * PAGE_SIZE as u64;
             page_file.seek(SeekFrom::Start(offset))
                 .map_err(|e| format!("Failed to seek to page {}: {}", current_page_id, e))?;
