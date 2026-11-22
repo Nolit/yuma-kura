@@ -534,13 +534,15 @@ impl PagedStorage {
                         let new_row_size = RowHeader::SIZE + new_row_data.len();
                         
                         if new_row_data.len() <= row_header.data_size as usize {
-                            // Row size stayed the same or decreased: update in place
-                            page.as_mut_slice()[row_data_start..row_data_start + new_row_data.len()]
-                                .copy_from_slice(&new_row_data);
-                            // Update row header with new data size
-                            row_header.data_size = new_row_data.len() as u16;
-                            page.as_mut_slice()[data_offset..data_offset + RowHeader::SIZE]
-                                .copy_from_slice(&row_header.to_bytes());
+                            // Row size stayed the same or decreased: update in place.
+                            // `data_size` is the space allocated to this row and is left
+                            // unchanged. The next row's offset is computed from it, and
+                            // rows are not compacted, so shrinking it would shift every
+                            // following row. The unused tail is zero-filled; the
+                            // deserializer ignores bytes after the last column.
+                            let slot = &mut page.as_mut_slice()[row_data_start..row_data_end];
+                            slot[..new_row_data.len()].copy_from_slice(&new_row_data);
+                            slot[new_row_data.len()..].fill(0);
                             updated_count += 1;
                         } else {
                             // Row size increased: mark old location as deleted and add new row
@@ -917,5 +919,98 @@ fn evaluate_comparison(left: &Value, op: &CmpOp, right: &Value) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::ColumnType;
+
+    /// Creates a fresh storage in a unique temp directory with table `t(id INT, name TEXT)`
+    /// holding three rows whose names are 10 bytes long. All rows fit in one page.
+    fn setup(test_name: &str) -> (PagedStorage, String) {
+        let dir = std::env::temp_dir()
+            .join(format!("mydb_paged_{}_{}", test_name, std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = PagedStorage::new(dir.clone()).unwrap();
+        s.create_table("t", vec![
+            ColumnDef { name: "id".into(), data_type: ColumnType::Int },
+            ColumnDef { name: "name".into(), data_type: ColumnType::Text },
+        ]).unwrap();
+        for (id, name) in [(1, "aaaaaaaaaa"), (2, "bbbbbbbbbb"), (3, "cccccccccc")] {
+            s.insert_row("t", vec![Value::Int(id), Value::Text(name.into())]).unwrap();
+        }
+        (s, dir)
+    }
+
+    fn id_eq(id: i64) -> Predicate {
+        Predicate::Cmp { col: "id".into(), op: CmpOp::Eq, val: Value::Int(id) }
+    }
+
+    fn set_name(value: &str) -> Vec<Assignment> {
+        vec![Assignment { column: "name".into(), value: value.into() }]
+    }
+
+    fn row(id: i64, name: &str) -> Row {
+        vec![Value::Int(id), Value::Text(name.into())]
+    }
+
+    #[test]
+    fn shrinking_update_keeps_following_rows_readable() {
+        let (mut s, dir) = setup("shrink_first");
+        let n = s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            s.get_all_rows("t").unwrap(),
+            vec![row(1, "x"), row(2, "bbbbbbbbbb"), row(3, "cccccccccc")]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shrinking_update_without_filter_updates_every_row() {
+        let (mut s, dir) = setup("shrink_all");
+        let n = s.update_rows("t", &set_name("x"), None).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(s.get_all_rows("t").unwrap(), vec![row(1, "x"), row(2, "x"), row(3, "x")]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn delete_after_shrinking_update_finds_following_rows() {
+        let (mut s, dir) = setup("shrink_delete");
+        s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        let n = s.delete_rows("t", Some(&id_eq(3))).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(s.get_all_rows("t").unwrap(), vec![row(1, "x"), row(2, "bbbbbbbbbb")]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shrunk_row_can_be_updated_again_to_original_length() {
+        let (mut s, dir) = setup("shrink_regrow");
+        s.update_rows("t", &set_name("x"), Some(&id_eq(2))).unwrap();
+        s.update_rows("t", &set_name("yyyyyyyyyy"), Some(&id_eq(2))).unwrap();
+        assert_eq!(
+            s.get_all_rows("t").unwrap(),
+            vec![row(1, "aaaaaaaaaa"), row(2, "yyyyyyyyyy"), row(3, "cccccccccc")]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shrinking_update_is_visible_after_reopen() {
+        let (mut s, dir) = setup("shrink_reopen");
+        s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        drop(s);
+        let reopened = PagedStorage::new(dir.clone()).unwrap();
+        assert_eq!(
+            reopened.get_all_rows("t").unwrap(),
+            vec![row(1, "x"), row(2, "bbbbbbbbbb"), row(3, "cccccccccc")]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
