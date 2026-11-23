@@ -53,14 +53,13 @@ impl Engine {
                     }
                 }
             },
+            // No fallback to memory here (unlike CSV): a failed start means Recovery failed
+            // or the files are broken. Falling back would let the user keep working in
+            // memory without noticing that their data on disk is damaged.
             StorageType::Paged(path) => {
-                match PagedStorage::new(path) {
-                    Ok(paged_storage) => Box::new(paged_storage),
-                    Err(e) => {
-                        eprintln!("Warning: Failed to initialize Paged storage: {}, falling back to memory", e);
-                        Box::new(MemStorage::default())
-                    }
-                }
+                let paged_storage = PagedStorage::new(path)
+                    .map_err(|e| format!("Failed to initialize paged storage: {}", e))?;
+                Box::new(paged_storage)
             },
         };
         
@@ -87,4 +86,84 @@ impl Engine {
     // Limited public accessors for executor to access internal state
     pub(crate) fn storage(&self) -> &dyn Storage { self.storage.as_ref() }
     pub(crate) fn storage_mut(&mut self) -> &mut dyn Storage { self.storage.as_mut() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// A fresh empty directory for one test
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mydb_engine_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn paged(dir: &Path) -> StorageType {
+        StorageType::Paged(dir.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn paged_startup_fails_without_falling_back_when_the_wal_is_corrupt() {
+        let dir = test_dir("corrupt_wal");
+        std::fs::write(dir.join("wal.log"), [1u8, 2, 3, 4, 5]).unwrap(); // not even a header
+
+        let error = Engine::new(paged(&dir)).err().expect("startup must fail, not fall back to memory");
+
+        assert!(error.contains("Failed to initialize paged storage"), "unexpected error: {}", error);
+        assert!(error.contains("corrupted"), "the cause is missing: {}", error);
+        // nothing was changed or created
+        assert_eq!(file_names(&dir), vec!["wal.log".to_string()]);
+        assert_eq!(std::fs::read(dir.join("wal.log")).unwrap(), vec![1u8, 2, 3, 4, 5]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn paged_startup_fails_without_falling_back_when_catalog_json_is_lost() {
+        let dir = test_dir("lost_catalog");
+        // catalog.json is broken and the WAL has no CatalogWrite to recover it from
+        std::fs::write(dir.join("wal.log"), []).unwrap();
+        std::fs::write(dir.join("catalog.json"), b"{\"tables\": {").unwrap();
+
+        let error = Engine::new(paged(&dir)).err().expect("startup must fail, not fall back to memory");
+
+        assert!(error.contains("Failed to initialize paged storage"), "unexpected error: {}", error);
+        assert!(error.contains("catalog.json"), "the cause is missing: {}", error);
+        assert_eq!(std::fs::read(dir.join("catalog.json")).unwrap(), b"{\"tables\": {");
+        assert_eq!(file_names(&dir), vec!["catalog.json".to_string(), "wal.log".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn paged_startup_succeeds_on_a_healthy_directory() {
+        let dir = test_dir("healthy");
+
+        assert!(Engine::new(paged(&dir)).is_ok());
+
+        assert!(dir.join("wal.log").exists()); // proves it is the paged storage, not memory
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn csv_startup_still_falls_back_to_memory() {
+        let dir = test_dir("csv_fallback");
+        // the parent of the CSV directory is a file, so the directory cannot be created
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let csv_path = blocker.join("data").to_string_lossy().to_string();
+
+        assert!(Engine::new(StorageType::Csv(csv_path)).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

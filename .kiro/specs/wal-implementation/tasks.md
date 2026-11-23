@@ -60,32 +60,32 @@ Pending ChangesとWALログの仕様については `.kiro/specs/wal-implementat
 Recoveryの仕様は、`.kiro/specs/wal-implementation/design.md` の「カタログの扱い」の「Recovery」、「Recoveryの適用ルール」、「WALの読み込みを止める条件」、「破損したWALの扱い」を参照してください。
 WALを先頭から順に読む処理は、ステップ1の `dump` とLSNの再開で作るものを、Recoveryでも使います。
 
-- [ ] `PagedStorage` に、Recoveryを行う関連関数（`recover(base_path)` など、`self` を取らないもの）の枠を実装する。起動時に、`catalog.json` のロードと `pages.dat` のオープンより前に呼ぶため。以降のタスクで、この関数に処理を足していく
+- [x] `PagedStorage` に、Recoveryを行う関連関数（`recover(base_path)` など、`self` を取らないもの）の枠を実装する。起動時に、`catalog.json` のロードと `pages.dat` のオープンより前に呼ぶため。以降のタスクで、この関数に処理を足していく
   - WALファイルがない、または空の場合は、何も適用せずに `Ok` で終了する（`catalog.json` と `pages.dat` には触れない。`pages.dat` も作らない）
   - 読み書きのエラーが起きた場合は、エラーを返す（「Recoveryが失敗した場合」は、起動を失敗させる）
-- [ ] Recoveryの最初に、WAL全体を検査する。書き戻しは、この検査が正常に終わってから始める
+- [x] Recoveryの最初に、WAL全体を検査する。書き戻しは、この検査が正常に終わってから始める
   - WALファイルを `WalReader` で先頭から最後まで読み、レコードをメモリに溜める
   - 「WALの読み込みを止める条件」に当たったら、何も書き戻さず、WALも切り詰めずにエラーを返す（`design.md` の「破損したWALの扱い」参照）。途中の破損と末尾の破損は区別しない
   - 最後まで正常に読めた（正常なEOFに達した）場合だけ、次のタスクに進む
   - Commitレコードの位置でトランザクションに区切る（`tx_id` は使わない）。最後のCommitレコードの終端のバイト位置を覚えておく（Commitレコードが1件もなければ0とする）
-- [ ] Commit済みトランザクションの `FullPageWrite` を `pages.dat` へ書き戻す
+- [x] Commit済みトランザクションの `FullPageWrite` を `pages.dat` へ書き戻す
   - `pages.dat` は、読み書きできる形で、なければ作成して開く。Recoveryは `PagedStorage::new` が `pages.dat` を作る処理より前に動くため、ファイルがない状態で呼ばれることがある。Commit済みの `FullPageWrite` が1件もない場合は、`pages.dat` を開かない
   - Commit済みの `FullPageWrite` を、LSN順に無条件で書き戻す。`page_id` が `pages.dat` の末尾より先なら、ファイルを延ばして書く
   - Commitレコードに達しなかった末尾のレコード（Commitされていないトランザクションのレコード）は、適用せずに捨てる
   - すべて書いた後に、`pages.dat` をfsyncする
-- [ ] Commit済みの `CatalogWrite` を `catalog.json` へ書き戻す
+- [x] Commit済みの `CatalogWrite` を `catalog.json` へ書き戻す
   - Commit済みのものの最後の1件だけを `catalog.json` に書く（トランザクションごとには書かない）。Commit済みの `CatalogWrite` が1件もない場合は、`catalog.json` に触れない
   - 書いた後に、`catalog.json` をfsyncする
-- [ ] Recoveryの最後に、WALファイルを最後のCommitレコードの終端で切り詰める（`File::set_len`）。切り詰めた後に、WALファイルをfsyncする
+- [x] Recoveryの最後に、WALファイルを最後のCommitレコードの終端で切り詰める（`File::set_len`）。切り詰めた後に、WALファイルをfsyncする
   - 切り詰めるのは、Commitされていないトランザクションの正しいレコードだけである（破損したレコードがある場合は、検査の段階でエラーになり、切り詰めない）。最後のCommitレコードの終端がファイルの末尾と同じなら、何もしない。Commitレコードが1件もない場合は、長さ0に切り詰める
   - 残すと、起動後に追記された新しいトランザクションのレコードと連続し、次回のRecoveryが「前のCommitから次のCommitまで」を1つのトランザクションとみなして、Commitされていないレコードまで適用してしまうため
   - 順序は、`pages.dat` のfsync → `catalog.json` のfsync → WALの切り詰めとfsync、とする。切り詰めが削るのはCommitされていないレコードだけなので、順序を変えても復旧の結果は変わらない。ただし、この順にしておけば、先の書き戻しが失敗したときに、WALに手を付けずに残せる
   - LSNは、切り詰め後の最後のレコードのLSN+1から再開する（WALが空なら1）
-- [ ] `PagedStorage::new` の起動順序を、ディレクトリ作成 → Recovery → `catalog.json` のロード → `pages.dat` のオープン → WALのオープン、に変更する
+- [x] `PagedStorage::new` の起動順序を、ディレクトリ作成 → Recovery → `catalog.json` のロード → `pages.dat` のオープン → WALのオープン、に変更する
   - Recoveryは `catalog.json` を読まない。ロードは、Recoveryが書き戻した後に行う
   - `catalog.json` がない場合は、これまでどおり空のカタログから始める
   - WALのオープンは、切り詰めの後に行う。追記位置は切り詰め後のファイル末尾とし、LSNは最後のレコードのLSN+1から採番する
-- [ ] `Engine::new` の `StorageType::Paged` の分岐で、`PagedStorage::new` が失敗しても、MemStorageにフォールバックせずにエラーを返す（CsvStorageのフォールバックは変えない）。`main.rs` は、起動の失敗を、エラーを表示した上で、0以外の終了コードで終了する
+- [x] `Engine::new` の `StorageType::Paged` の分岐で、`PagedStorage::new` が失敗しても、MemStorageにフォールバックせずにエラーを返す（CsvStorageのフォールバックは変えない）。`main.rs` は、起動の失敗を、エラーを表示した上で、0以外の終了コードで終了する
 
 ### ステップ2 完了条件
 

@@ -30,12 +30,9 @@ fn main() {
     let storage_type_enum = StorageType::from_arg(storage_type);
     
     let user_name = "yuma";
-    let mut engine = match Engine::new(storage_type_enum.clone()) {
+    let mut engine = match start_engine(storage_type_enum.clone(), &mut std::io::stderr()) {
         Ok(engine) => engine,
-        Err(e) => {
-            eprintln!("Failed to initialize engine: {}", e);
-            return;
-        }
+        Err(code) => std::process::exit(code),
     };
     
     println!("Yuma-Kura Database Engine");
@@ -122,6 +119,18 @@ fn main() {
     }
 }
 
+/// Exit code when the engine cannot be started (e.g. Recovery failed)
+const STARTUP_FAILURE_EXIT_CODE: i32 = 1;
+
+/// Open the engine. On failure the error is written to `err` and the exit code to stop
+/// the process with is returned (the caller calls `process::exit`, so this can be tested).
+fn start_engine(storage_type: StorageType, err: &mut impl std::io::Write) -> Result<Engine, i32> {
+    Engine::new(storage_type).map_err(|e| {
+        let _ = writeln!(err, "Error: {}", e);
+        STARTUP_FAILURE_EXIT_CODE
+    })
+}
+
 /// The process exit code for an error from `Engine::execute`:
 /// `Some(code)` if the process must stop (fatal storage error), `None` if the session can continue.
 fn fatal_exit_code(error: &ExecuteError) -> Option<i32> {
@@ -194,6 +203,64 @@ mod tests {
     #[test]
     fn sql_errors_keep_the_session_going() {
         assert_eq!(fatal_exit_code(&ExecuteError::Sql("table not found".into())), None);
+    }
+
+    fn startup_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mydb_main_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn paged(dir: &std::path::Path) -> StorageType {
+        StorageType::Paged(dir.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn the_startup_failure_exit_code_is_not_zero() {
+        assert_ne!(STARTUP_FAILURE_EXIT_CODE, 0);
+    }
+
+    #[test]
+    fn a_corrupt_wal_fails_the_startup_with_a_non_zero_code_and_a_message() {
+        let dir = startup_dir("corrupt_wal");
+        std::fs::write(dir.join("wal.log"), [1u8, 2, 3, 4, 5]).unwrap();
+        let mut err = Vec::new();
+
+        let result = start_engine(paged(&dir), &mut err);
+
+        assert_eq!(result.err(), Some(STARTUP_FAILURE_EXIT_CODE));
+        let message = String::from_utf8(err).unwrap();
+        assert!(message.contains("Failed to initialize paged storage"), "unexpected message: {}", message);
+        assert!(message.contains("corrupted"), "the cause is missing: {}", message);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_lost_catalog_json_fails_the_startup_with_a_non_zero_code() {
+        let dir = startup_dir("lost_catalog");
+        std::fs::write(dir.join("wal.log"), []).unwrap();
+        std::fs::write(dir.join("catalog.json"), b"{\"tables\": {").unwrap();
+        let mut err = Vec::new();
+
+        let result = start_engine(paged(&dir), &mut err);
+
+        assert_eq!(result.err(), Some(STARTUP_FAILURE_EXIT_CODE));
+        let message = String::from_utf8(err).unwrap();
+        assert!(message.contains("catalog.json"), "unexpected message: {}", message);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_healthy_startup_succeeds_and_prints_nothing() {
+        let dir = startup_dir("healthy");
+        let mut err = Vec::new();
+
+        assert!(start_engine(StorageType::Memory, &mut err).is_ok());
+        assert!(start_engine(paged(&dir), &mut err).is_ok());
+
+        assert!(err.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
