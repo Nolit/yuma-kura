@@ -3,7 +3,7 @@
 
 use crate::ast::{ColumnDef, Assignment, Predicate};
 use crate::engine::value::Value;
-use super::{Storage, Row};
+use super::{Storage, Row, FatalError};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write, Seek, SeekFrom};
@@ -490,6 +490,14 @@ impl Iterator for CsvRowIterator {
 }
 
 impl Storage for CsvStorage {
+    /// No-op: insert_row / update_rows / delete_rows already wrote to the real data.
+    fn commit_changes(&mut self) -> Result<(), FatalError> {
+        Ok(())
+    }
+
+    /// No-op: the changes were already applied when the SQL ran and cannot be discarded.
+    fn abort_changes(&mut self) {}
+
     fn create_table(&mut self, name: &str, schema: Vec<ColumnDef>) -> Result<(), String> {
         let table_name = name.to_lowercase();
         

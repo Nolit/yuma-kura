@@ -7,7 +7,7 @@ pub mod parser;
 use parser::parse_sql;
 use ast::{Command, MetaCmd};
 mod engine;
-use engine::{Engine, QueryResult};
+use engine::{Engine, ExecuteError, QueryResult};
 mod storage;
 use storage::StorageType;
 
@@ -15,6 +15,17 @@ const HISTORY_FILE: &str = ".yumakura_history";
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    // `dump-wal <path>`: print the WAL file and exit (no database is opened)
+    if let Some(path) = dump_wal_path(&args) {
+        let result = path.and_then(|p| Engine::dump_wal(std::path::Path::new(p), &mut std::io::stdout()));
+        if let Err(e) = result {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let storage_type = args.get(1).map(|s| s.as_str()).unwrap_or("mem");
     let storage_type_enum = StorageType::from_arg(storage_type);
     
@@ -88,9 +99,16 @@ fn main() {
                         println!("Columns: {:?}", columns);
                         println!("Rows: {:?}", rows);
                     },
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
-                    }
+                    Err(e) => match fatal_exit_code(&e) {
+                        // The storage state cannot be trusted: stop here.
+                        // The next start runs Recovery (history is not saved on purpose).
+                        Some(code) => {
+                            eprintln!("{}", e);
+                            std::process::exit(code);
+                        }
+                        // Ordinary SQL error: report it and keep the session going
+                        None => eprintln!("Error: {}", e),
+                    },
                 }
             }
             Err(e) => {
@@ -102,6 +120,28 @@ fn main() {
     if let Err(e) = rl.save_history(HISTORY_FILE) {
         eprintln!("Failed to save history: {}", e);
     }
+}
+
+/// The process exit code for an error from `Engine::execute`:
+/// `Some(code)` if the process must stop (fatal storage error), `None` if the session can continue.
+fn fatal_exit_code(error: &ExecuteError) -> Option<i32> {
+    match error {
+        ExecuteError::Fatal(_) => Some(1),
+        ExecuteError::Sql(_) => None,
+    }
+}
+
+/// `Some(..)` if the command line is the `dump-wal` subcommand:
+/// the WAL file path, or a usage error when the path is missing.
+fn dump_wal_path(args: &[String]) -> Option<Result<&str, String>> {
+    if args.get(1).map(|s| s.as_str()) != Some("dump-wal") {
+        return None;
+    }
+    Some(
+        args.get(2)
+            .map(|s| s.as_str())
+            .ok_or_else(|| "Usage: dump-wal <path to wal.log>".to_string()),
+    )
 }
 
 fn parse_command(line: &str) -> Result<Command, String> {
@@ -117,6 +157,43 @@ fn parse_meta(s: &str) -> Result<MetaCmd, String> {
         _ if s.eq_ignore_ascii_case(".exit") || s.eq_ignore_ascii_case(".quit") => Ok(MetaCmd::Exit),
         _ if s.eq_ignore_ascii_case(".help") => Ok(MetaCmd::Help),
         _ => Err(format!("Unrecognized command: {}", s)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use storage::FatalError;
+
+    #[test]
+    fn fatal_errors_stop_the_process_with_a_non_zero_code() {
+        let code = fatal_exit_code(&ExecuteError::Fatal(FatalError("disk gone".into())));
+        assert_eq!(code, Some(1));
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn dump_wal_subcommand_takes_the_path_argument() {
+        assert_eq!(dump_wal_path(&args(&["db", "dump-wal", "x/wal.log"])), Some(Ok("x/wal.log")));
+    }
+
+    #[test]
+    fn dump_wal_without_a_path_is_a_usage_error() {
+        assert!(matches!(dump_wal_path(&args(&["db", "dump-wal"])), Some(Err(_))));
+    }
+
+    #[test]
+    fn other_arguments_are_not_the_dump_wal_subcommand() {
+        assert_eq!(dump_wal_path(&args(&["db"])), None);
+        assert_eq!(dump_wal_path(&args(&["db", "paged:mydb.db"])), None);
+    }
+
+    #[test]
+    fn sql_errors_keep_the_session_going() {
+        assert_eq!(fatal_exit_code(&ExecuteError::Sql("table not found".into())), None);
     }
 }
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::engine::table::Table;
 use crate::ast::{ColumnDef, Assignment, Predicate, CmpOp};
 use crate::engine::value::Value;
-use super::{Storage, Row};
+use super::{Storage, Row, FatalError};
 
 #[derive(Default)]
 pub struct MemStorage {
@@ -12,6 +12,14 @@ pub struct MemStorage {
 }
 
 impl Storage for MemStorage {
+    /// No-op: insert_row / update_rows / delete_rows already wrote to the real data.
+    fn commit_changes(&mut self) -> Result<(), FatalError> {
+        Ok(())
+    }
+
+    /// No-op: the changes were already applied when the SQL ran and cannot be discarded.
+    fn abort_changes(&mut self) {}
+
     fn create_table(&mut self, name: &str, schema: Vec<ColumnDef>) -> Result<(), String> {
         let key = name.to_lowercase();
         if self.tables.contains_key(&key) {

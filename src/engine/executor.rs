@@ -1,6 +1,6 @@
 // src/engine/executor.rs
 use crate::ast::{Stmt, ColumnType, Predicate, CmpOp};
-use super::{Engine, value::Value};
+use super::{Engine, ExecuteError, value::Value};
 
 #[derive(Debug)]
 pub enum QueryResult {
@@ -8,28 +8,52 @@ pub enum QueryResult {
     Rows { columns: Vec<String>, rows: Vec<Vec<Value>> },
 }
 
-pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, String> {
+/// Run a data-changing statement and commit it (auto commit).
+/// - `run` fails: `abort_changes()` discards the uncommitted changes, and the error is a
+///   normal SQL error (`ExecuteError::Sql`).
+/// - `run` succeeds: `commit_changes()` makes it durable. Its error is fatal and is passed
+///   on as it is (`ExecuteError::Fatal`); `abort_changes()` is NOT called, because the
+///   WAL may already hold the commit and recovery must decide at the next start.
+fn run_and_commit<T>(
+    engine: &mut Engine,
+    run: impl FnOnce(&mut Engine) -> Result<T, String>,
+) -> Result<T, ExecuteError> {
+    match run(engine) {
+        Ok(value) => {
+            engine.storage_mut().commit_changes().map_err(ExecuteError::Fatal)?;
+            Ok(value)
+        }
+        Err(message) => {
+            engine.storage_mut().abort_changes();
+            Err(ExecuteError::Sql(message))
+        }
+    }
+}
+
+pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, ExecuteError> {
     match stmt {
         Stmt::CreateTable { table, columns } => {
-            engine.storage_mut().create_table(&table, columns)?;
+            run_and_commit(engine, |e| e.storage_mut().create_table(&table, columns))?;
             Ok(QueryResult::Acknowledged)
         }
         Stmt::InsertValues { table, values } => {
-            let schema = engine.storage().schema(&table)?;
+            run_and_commit(engine, |e| {
+                let schema = e.storage().schema(&table)?;
 
-            if values.len() != schema.len() {
-                return Err(format!(
-                    "column count mismatch: expected {}, got {}",
-                    schema.len(), values.len()
-                ));
-            }
+                if values.len() != schema.len() {
+                    return Err(format!(
+                        "column count mismatch: expected {}, got {}",
+                        schema.len(), values.len()
+                    ));
+                }
 
-            let parsed = values.iter().zip(schema)
-                .map(|(raw, col)| parse_value(raw, &col.data_type)
-                     .map_err(|e| format!("column {}: {e}", col.name)))
-                .collect::<Result<Vec<_>, _>>()?;
+                let parsed = values.iter().zip(schema)
+                    .map(|(raw, col)| parse_value(raw, &col.data_type)
+                         .map_err(|e| format!("column {}: {e}", col.name)))
+                    .collect::<Result<Vec<_>, _>>()?;
 
-            engine.storage_mut().insert_row(&table, parsed)?;
+                e.storage_mut().insert_row(&table, parsed)
+            })?;
             Ok(QueryResult::Acknowledged)
         }
         Stmt::Select { table, columns: _, filter } => {
@@ -58,24 +82,29 @@ pub(super) fn execute(engine: &mut Engine, stmt: Stmt) -> Result<QueryResult, St
             Ok(QueryResult::Rows { columns: cols, rows: all_rows })
         }
         Stmt::Update { table, assignments, filter } => {
-            // Reject unknown columns instead of silently matching zero rows
-            {
-                let schema = engine.storage().schema(&table)?;
-                if let Some(ref predicate) = filter {
-                    check_predicate_columns(predicate, &schema)?;
-                }
-                for a in &assignments {
-                    if !schema.iter().any(|c| c.name == a.column) {
-                        return Err(format!("column '{}' not found in table '{}'", a.column, table));
+            let updated_count = run_and_commit(engine, |e| {
+                // Reject unknown columns instead of silently matching zero rows
+                {
+                    let schema = e.storage().schema(&table)?;
+                    if let Some(ref predicate) = filter {
+                        check_predicate_columns(predicate, &schema)?;
+                    }
+                    for a in &assignments {
+                        if !schema.iter().any(|c| c.name == a.column) {
+                            return Err(format!("column '{}' not found in table '{}'", a.column, table));
+                        }
                     }
                 }
-            }
-            let updated_count = engine.storage_mut().update_rows(&table, &assignments, filter.as_ref())?;
+                e.storage_mut().update_rows(&table, &assignments, filter.as_ref())
+            })?;
+            // Report only after the commit succeeded
             println!("Updated {} rows", updated_count);
             Ok(QueryResult::Acknowledged)
         }
         Stmt::Delete { table, filter } => {
-            let deleted_count = engine.storage_mut().delete_rows(&table, filter.as_ref())?;
+            let deleted_count = run_and_commit(engine, |e| {
+                e.storage_mut().delete_rows(&table, filter.as_ref())
+            })?;
             println!("Deleted {} rows", deleted_count);
             Ok(QueryResult::Acknowledged)
         }
@@ -156,5 +185,157 @@ fn evaluate_comparison(left: &Value, op: &CmpOp, right: &Value) -> bool {
             _ => false, // Size comparison is invalid for boolean values
         },
         _ => false, // Cannot compare values of different types
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{ColumnDef, Assignment, Projection};
+    use crate::storage::{Storage, FatalError, Row};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct Calls {
+        commits: u32,
+        aborts: u32,
+    }
+
+    /// A storage that only records commit/abort calls and can be told to fail
+    struct MockStorage {
+        schema: Vec<ColumnDef>,
+        calls: Rc<RefCell<Calls>>,
+        fail_insert: bool,
+        fail_commit: bool,
+    }
+
+    impl Storage for MockStorage {
+        fn create_table(&mut self, _name: &str, _schema: Vec<ColumnDef>) -> Result<(), String> { Ok(()) }
+        fn insert_row(&mut self, _table: &str, _row: Row) -> Result<(), String> {
+            if self.fail_insert { Err("insert failed".to_string()) } else { Ok(()) }
+        }
+        fn update_rows(&mut self, _t: &str, _a: &[Assignment], _f: Option<&Predicate>) -> Result<usize, String> { Ok(1) }
+        fn delete_rows(&mut self, _t: &str, _f: Option<&Predicate>) -> Result<usize, String> { Ok(1) }
+        fn commit_changes(&mut self) -> Result<(), FatalError> {
+            self.calls.borrow_mut().commits += 1;
+            if self.fail_commit { Err(FatalError("disk gone".to_string())) } else { Ok(()) }
+        }
+        fn abort_changes(&mut self) {
+            self.calls.borrow_mut().aborts += 1;
+        }
+        fn schema(&self, _table: &str) -> Result<&[ColumnDef], String> { Ok(&self.schema) }
+        fn rows<'a>(&'a self, _table: &str) -> Result<Box<dyn Iterator<Item = &'a Row> + 'a>, String> {
+            Ok(Box::new(std::iter::empty()))
+        }
+    }
+
+    fn engine_with(fail_insert: bool, fail_commit: bool) -> (Engine, Rc<RefCell<Calls>>) {
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let storage = MockStorage {
+            schema: vec![ColumnDef { name: "id".into(), data_type: ColumnType::Int }],
+            calls: Rc::clone(&calls),
+            fail_insert,
+            fail_commit,
+        };
+        (Engine { storage: Box::new(storage) }, calls)
+    }
+
+    fn insert(values: &[&str]) -> Stmt {
+        Stmt::InsertValues { table: "t".into(), values: values.iter().map(|v| v.to_string()).collect() }
+    }
+
+    #[test]
+    fn successful_statement_is_committed_once_and_not_aborted() {
+        let (mut engine, calls) = engine_with(false, false);
+        assert!(execute(&mut engine, insert(&["1"])).is_ok());
+        assert_eq!((calls.borrow().commits, calls.borrow().aborts), (1, 0));
+
+        let create = Stmt::CreateTable { table: "t".into(), columns: vec![] };
+        assert!(execute(&mut engine, create).is_ok());
+        let update = Stmt::Update { table: "t".into(), assignments: vec![], filter: None };
+        assert!(execute(&mut engine, update).is_ok());
+        let delete = Stmt::Delete { table: "t".into(), filter: None };
+        assert!(execute(&mut engine, delete).is_ok());
+        assert_eq!((calls.borrow().commits, calls.borrow().aborts), (4, 0));
+    }
+
+    #[test]
+    fn storage_error_before_commit_aborts_and_is_a_sql_error() {
+        let (mut engine, calls) = engine_with(true, false);
+        let result = execute(&mut engine, insert(&["1"]));
+        assert!(matches!(result, Err(ExecuteError::Sql(ref m)) if m == "insert failed"));
+        assert_eq!((calls.borrow().commits, calls.borrow().aborts), (0, 1));
+    }
+
+    #[test]
+    fn validation_error_before_commit_aborts_and_is_a_sql_error() {
+        let (mut engine, calls) = engine_with(false, false);
+        // two values for a one-column table
+        let result = execute(&mut engine, insert(&["1", "2"]));
+        assert!(matches!(result, Err(ExecuteError::Sql(ref m)) if m.contains("column count mismatch")));
+        assert_eq!((calls.borrow().commits, calls.borrow().aborts), (0, 1));
+
+        // unknown column in UPDATE
+        let update = Stmt::Update {
+            table: "t".into(),
+            assignments: vec![Assignment { column: "nope".into(), value: "1".into() }],
+            filter: None,
+        };
+        assert!(matches!(execute(&mut engine, update), Err(ExecuteError::Sql(_))));
+        assert_eq!((calls.borrow().commits, calls.borrow().aborts), (0, 2));
+    }
+
+    #[test]
+    fn commit_error_is_passed_on_as_fatal_without_abort() {
+        let (mut engine, calls) = engine_with(false, true);
+        let result = execute(&mut engine, insert(&["1"]));
+        assert!(matches!(result, Err(ExecuteError::Fatal(FatalError(ref m))) if m == "disk gone"));
+        assert_eq!((calls.borrow().commits, calls.borrow().aborts), (1, 0));
+    }
+
+    #[test]
+    fn select_neither_commits_nor_aborts() {
+        let (mut engine, calls) = engine_with(false, false);
+        let select = Stmt::Select { table: "t".into(), columns: Projection::All, filter: None };
+        assert!(matches!(execute(&mut engine, select), Ok(QueryResult::Rows { .. })));
+        assert_eq!((calls.borrow().commits, calls.borrow().aborts), (0, 0));
+    }
+
+    #[test]
+    fn statements_through_a_paged_engine_are_written_to_the_wal_and_survive_reopening() {
+        use crate::storage::paged::PagedStorage;
+        let dir = std::env::temp_dir()
+            .join(format!("mydb_engine_paged_{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        let wal_len = |dir: &str| std::fs::metadata(std::path::Path::new(dir).join("wal.log")).unwrap().len();
+        let mut engine = Engine { storage: Box::new(PagedStorage::new(dir.clone()).unwrap()) };
+
+        let columns = vec![ColumnDef { name: "id".into(), data_type: ColumnType::Int }];
+        execute(&mut engine, Stmt::CreateTable { table: "t".into(), columns }).unwrap();
+        execute(&mut engine, insert(&["1"])).unwrap();
+        execute(&mut engine, insert(&["2"])).unwrap();
+        let len_after_inserts = wal_len(&dir);
+        assert!(len_after_inserts > 0);
+
+        // failing statements change neither the data nor the WAL
+        assert!(matches!(execute(&mut engine, insert(&["1", "2"])), Err(ExecuteError::Sql(_))));
+        assert!(matches!(execute(&mut engine, insert(&["not a number"])), Err(ExecuteError::Sql(_))));
+        assert_eq!(wal_len(&dir), len_after_inserts);
+
+        // the engine keeps working after the failures
+        let delete = Stmt::Delete {
+            table: "t".into(),
+            filter: Some(Predicate::Cmp { col: "id".into(), op: CmpOp::Eq, val: Value::Int(1) }),
+        };
+        execute(&mut engine, delete).unwrap();
+        assert!(wal_len(&dir) > len_after_inserts);
+        drop(engine);
+
+        let reopened = PagedStorage::new(dir.clone()).unwrap();
+        assert_eq!(reopened.get_all_rows("t").unwrap(), vec![vec![Value::Int(2)]]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

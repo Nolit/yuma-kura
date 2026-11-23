@@ -4,7 +4,9 @@
 
 use crate::ast::{ColumnDef, Assignment, Predicate, CmpOp};
 use crate::engine::value::Value;
-use super::{Storage, Row};
+use super::{Storage, Row, FatalError};
+use super::pending::PendingChange;
+use super::wal::{Wal, WalBody};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
@@ -16,10 +18,11 @@ const PAGE_SIZE: usize = 4096;
 /// Maximum size of a single data item: 1KB
 const MAX_DATA_SIZE: usize = 1024;
 /// Page header size
-const PAGE_HEADER_SIZE: usize = 20;
+const PAGE_HEADER_SIZE: usize = 28;
 
 /// Page-aligned memory structure
 #[repr(align(4096))]
+#[derive(Clone)]
 pub struct PageBytes([u8; PAGE_SIZE]);
 
 impl PageBytes {
@@ -36,7 +39,7 @@ impl PageBytes {
     }
 }
 
-/// Page header (first 20 bytes of a page)
+/// Page header (first 28 bytes of a page)
 #[repr(C, packed)]
 struct PageHeader {
     magic: u32,           // Magic number: 0x50414745 ("PAGE")
@@ -45,7 +48,8 @@ struct PageHeader {
     row_count: u16,       // Number of rows stored in this page
     next_page: u32,       // Next page ID (for overflow pages, 0=none)
     flags: u16,           // Flags (for future use)
-    _reserved: u16,       // Reserved (to align to 20 bytes)
+    _reserved: u16,       // Reserved (padding before last_applied_lsn)
+    last_applied_lsn: u64, // LSN of the last WAL record applied to this page (0 = no WAL applied)
 }
 
 impl PageHeader {
@@ -60,6 +64,7 @@ impl PageHeader {
             next_page: 0,
             flags: 0,
             _reserved: 0,
+            last_applied_lsn: 0,
         }
     }
     
@@ -81,6 +86,10 @@ impl PageHeader {
             next_page: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
             flags: u16::from_le_bytes([bytes[16], bytes[17]]),
             _reserved: u16::from_le_bytes([bytes[18], bytes[19]]),
+            last_applied_lsn: u64::from_le_bytes([
+                bytes[20], bytes[21], bytes[22], bytes[23],
+                bytes[24], bytes[25], bytes[26], bytes[27],
+            ]),
         })
     }
     
@@ -93,6 +102,7 @@ impl PageHeader {
         bytes[12..16].copy_from_slice(&self.next_page.to_le_bytes());
         bytes[16..18].copy_from_slice(&self.flags.to_le_bytes());
         bytes[18..20].copy_from_slice(&self._reserved.to_le_bytes());
+        bytes[20..28].copy_from_slice(&self.last_applied_lsn.to_le_bytes());
         bytes
     }
     
@@ -157,7 +167,7 @@ impl RowHeader {
 }
 
 /// Table metadata (stored in catalog.json)
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TableMetadata {
     schema: Vec<ColumnDef>,
     next_row_id: usize,
@@ -166,7 +176,7 @@ struct TableMetadata {
 }
 
 /// Catalog information (stored in catalog.json)
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Catalog {
     tables: HashMap<String, TableMetadata>,
     next_page_id: u32,    // Next available page ID (global)
@@ -178,6 +188,14 @@ pub struct PagedStorage {
     base_path: PathBuf,
     catalog: Catalog,
     page_file: Option<File>, // Page file (shared by all tables)
+    /// Pages modified during the current SQL (page_id -> page image).
+    /// read_page consults this map before the page file.
+    pending_pages: HashMap<u32, Box<PageBytes>>,
+    /// Copy of the catalog modified during the current SQL.
+    /// `catalog` is replaced by it only after the WAL commit is durable.
+    working_catalog: Option<Catalog>,
+    /// The write-ahead log (`wal.log` in the same directory)
+    wal: Wal,
 }
 
 impl PagedStorage {
@@ -210,28 +228,182 @@ impl PagedStorage {
             .write(true)
             .open(&page_file_path)
             .map_err(|e| format!("Failed to open page file: {}", e))?;
+
+        // Open the WAL (last in the startup order; Recovery will run before the catalog load)
+        let wal = Wal::open(&base_path.join("wal.log"))?;
         
         Ok(Self {
             base_path,
             catalog,
             page_file: Some(page_file),
+            pending_pages: HashMap::new(),
+            working_catalog: None,
+            wal,
         })
     }
+
+    /// Start of a data-changing SQL. One transaction is one SQL, so the previous SQL must
+    /// have been committed or aborted: otherwise its staged pages would be mixed with a
+    /// working catalog that no longer matches them.
+    fn begin_sql(&mut self) -> Result<(), String> {
+        if self.working_catalog.is_some() || !self.pending_pages.is_empty() {
+            return Err("previous statement was neither committed nor aborted".to_string());
+        }
+        self.begin_working_catalog();
+        Ok(())
+    }
+
+    /// Start a working copy of the committed catalog (called at the start of an SQL)
+    fn begin_working_catalog(&mut self) {
+        self.working_catalog = Some(self.catalog.clone());
+    }
+
+    /// The catalog to read during an SQL: the working copy if present, else the committed one
+    fn active_catalog(&self) -> &Catalog {
+        self.working_catalog.as_ref().unwrap_or(&self.catalog)
+    }
+
+    /// The catalog to modify during an SQL. Never touches the committed catalog.
+    fn active_catalog_mut(&mut self) -> Result<&mut Catalog, String> {
+        self.working_catalog.as_mut()
+            .ok_or_else(|| "No working catalog: SQL not started".to_string())
+    }
     
+    /// Serialize a catalog to the catalog.json format (shared by catalog.json and CatalogWrite)
+    fn serialize_catalog(catalog: &Catalog) -> Result<Vec<u8>, String> {
+        serde_json::to_string_pretty(catalog)
+            .map(String::into_bytes)
+            .map_err(|e| format!("Failed to serialize catalog: {}", e))
+    }
+
     /// Save catalog
     fn save_catalog(&self) -> Result<(), String> {
         let catalog_path = self.base_path.join("catalog.json");
-        let content = serde_json::to_string_pretty(&self.catalog)
-            .map_err(|e| format!("Failed to serialize catalog: {}", e))?;
+        let content = Self::serialize_catalog(&self.catalog)?;
         
         std::fs::write(&catalog_path, content)
             .map_err(|e| format!("Failed to write catalog.json: {}", e))?;
         
         Ok(())
     }
+
+    /// Build the PendingChange list for the current SQL from pending_pages and
+    /// working_catalog. Read-only: neither of them is modified.
+    /// - one PageWrite per staged page, in page_id order
+    /// - one CatalogWrite (after the PageWrites) if the working catalog differs from the committed one
+    fn build_pending_changes(&self) -> Result<Vec<PendingChange>, String> {
+        let mut page_ids: Vec<u32> = self.pending_pages.keys().copied().collect();
+        page_ids.sort_unstable();
+
+        let mut changes = Vec::with_capacity(page_ids.len() + 1);
+        for page_id in page_ids {
+            let page = &self.pending_pages[&page_id];
+            let mut page_data = [0u8; PAGE_SIZE];
+            page_data.copy_from_slice(page.as_slice());
+            changes.push(PendingChange::PageWrite { page_id, page_data });
+        }
+
+        if let Some(working) = &self.working_catalog {
+            // Compare as serde_json::Value so that HashMap iteration order does not matter
+            let committed_value = serde_json::to_value(&self.catalog)
+                .map_err(|e| format!("Failed to serialize catalog: {}", e))?;
+            let working_value = serde_json::to_value(working)
+                .map_err(|e| format!("Failed to serialize catalog: {}", e))?;
+            if committed_value != working_value {
+                changes.push(PendingChange::CatalogWrite {
+                    catalog_json: Self::serialize_catalog(working)?,
+                });
+            }
+        }
+
+        Ok(changes)
+    }
+
+    /// Write `lsn` into the `last_applied_lsn` field of a page image's header.
+    /// Only `paged.rs` knows the page layout; the WAL does not.
+    fn stamp_last_applied_lsn(page: &mut [u8; PAGE_SIZE], lsn: u64) -> Result<(), String> {
+        let mut header = PageHeader::from_bytes(&page[0..PAGE_HEADER_SIZE])?;
+        header.last_applied_lsn = lsn;
+        page[0..PAGE_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+        Ok(())
+    }
+
+    /// Append `changes` to the WAL as one transaction, then a Commit record, then fsync.
+    /// - PageWrite: the page image is copied, stamped with the LSN it is about to get
+    ///   and appended as FullPageWrite (the `PendingChange` itself is not modified).
+    /// - CatalogWrite: appended as CatalogWrite.
+    /// Returns the LSN-stamped page images, in the same order, so that pages.dat can
+    /// be written with exactly the bytes that are in the WAL.
+    /// An empty `changes` writes nothing (no Commit-only transaction).
+    fn append_changes_to_wal(&mut self, changes: &[PendingChange]) -> Result<Vec<(u32, Box<PageBytes>)>, String> {
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut stamped_pages = Vec::new();
+        for change in changes {
+            match change {
+                PendingChange::PageWrite { page_id, page_data } => {
+                    let mut image = *page_data;
+                    let lsn = self.wal.next_lsn();
+                    Self::stamp_last_applied_lsn(&mut image, lsn)?;
+                    let appended = self.wal.append(WalBody::FullPageWrite { page_id: *page_id, page_data: image })?;
+                    if appended != lsn {
+                        return Err(format!("WAL assigned LSN {} but the page was stamped with {}", appended, lsn));
+                    }
+                    let mut page = Box::new(PageBytes::new());
+                    page.as_mut_slice().copy_from_slice(&image);
+                    stamped_pages.push((*page_id, page));
+                }
+                PendingChange::CatalogWrite { catalog_json } => {
+                    self.wal.append(WalBody::CatalogWrite { catalog_json: catalog_json.clone() })?;
+                }
+            }
+        }
+
+        self.wal.append(WalBody::Commit)?;
+        self.wal.sync()?;
+        Ok(stamped_pages)
+    }
+
+    /// Make the current SQL's changes durable. Every error in here is fatal.
+    /// 1. build the PendingChange list
+    /// 2. append it + Commit to the WAL and fsync (the commit is decided here)
+    /// 3. replace the committed catalog with the working catalog
+    /// 4. write the LSN-stamped pages (the same bytes as in the WAL) to pages.dat
+    /// 5. write catalog.json if the catalog changed
+    /// 6. drop the staged pages
+    /// On failure nothing is rolled back or discarded: the caller must stop the
+    /// process and let Recovery repair the files at the next start.
+    fn commit_changes_inner(&mut self) -> Result<(), String> {
+        let changes = self.build_pending_changes()?;
+        let stamped_pages = self.append_changes_to_wal(&changes)?;
+
+        if let Some(working) = self.working_catalog.take() {
+            self.catalog = working;
+        }
+
+        for (page_id, page) in &stamped_pages {
+            self.write_page_to_file(*page_id, page)?;
+        }
+        if changes.iter().any(|c| matches!(c, PendingChange::CatalogWrite { .. })) {
+            self.save_catalog()?;
+        }
+
+        self.pending_pages.clear();
+        Ok(())
+    }
     
-    /// Read a page from file
+    /// Read a page: pending_pages first, then the page file
     fn read_page(&mut self, page_id: u32) -> Result<Box<PageBytes>, String> {
+        if let Some(page) = self.pending_pages.get(&page_id) {
+            return Ok(page.clone());
+        }
+        self.read_page_from_file(page_id)
+    }
+
+    /// Read a page directly from the page file (ignores pending_pages)
+    fn read_page_from_file(&mut self, page_id: u32) -> Result<Box<PageBytes>, String> {
         let file = self.page_file.as_mut()
             .ok_or("Page file not open".to_string())?;
         
@@ -246,8 +418,14 @@ impl PagedStorage {
         Ok(page)
     }
     
-    /// Write a page to file
+    /// Stage a modified page in pending_pages. Nothing is written to the page file here.
     fn write_page(&mut self, page_id: u32, page: &PageBytes) -> Result<(), String> {
+        self.pending_pages.insert(page_id, Box::new(page.clone()));
+        Ok(())
+    }
+
+    /// Write a page directly to the page file
+    fn write_page_to_file(&mut self, page_id: u32, page: &PageBytes) -> Result<(), String> {
         let file = self.page_file.as_mut()
             .ok_or("Page file not open".to_string())?;
         
@@ -266,8 +444,9 @@ impl PagedStorage {
     
     /// Create a new page
     fn create_new_page(&mut self) -> Result<u32, String> {
-        let page_id = self.catalog.next_page_id;
-        self.catalog.next_page_id += 1;
+        let catalog = self.active_catalog_mut()?;
+        let page_id = catalog.next_page_id;
+        catalog.next_page_id += 1;
         
         let mut page = Box::new(PageBytes::new());
         let header = PageHeader::new(page_id);
@@ -382,7 +561,7 @@ impl PagedStorage {
     
     /// Check if a page has free space
     fn find_page_with_space(&mut self, table_name: &str, required_space: usize) -> Result<Option<u32>, String> {
-        let table_meta = self.catalog.tables.get(table_name)
+        let table_meta = self.active_catalog().tables.get(table_name)
             .ok_or("table not found")?;
         
         // Check from the last page
@@ -591,7 +770,7 @@ impl PagedStorage {
                                 self.write_page(new_page_id, &new_page)?;
                                 
                                 // Append the new page to the end of the chain
-                                let tail_page_id = self.catalog.tables.get(table_name)
+                                let tail_page_id = self.active_catalog().tables.get(table_name)
                                     .ok_or("table not found")?
                                     .last_page_id;
                                 if tail_page_id == page_id {
@@ -607,7 +786,7 @@ impl PagedStorage {
                                 }
 
                                 // Update table metadata to track new page
-                                if let Some(table_meta) = self.catalog.tables.get_mut(table_name) {
+                                if let Some(table_meta) = self.active_catalog_mut()?.tables.get_mut(table_name) {
                                     table_meta.last_page_id = new_page_id;
                                 }
                                 
@@ -635,11 +814,13 @@ impl PagedStorage {
     }
 }
 
-impl Storage for PagedStorage {
-    fn create_table(&mut self, name: &str, schema: Vec<ColumnDef>) -> Result<(), String> {
+// The bodies of the four data-changing operations. The `Storage` impl below wraps
+// each of them with `begin_sql`.
+impl PagedStorage {
+    fn create_table_inner(&mut self, name: &str, schema: Vec<ColumnDef>) -> Result<(), String> {
         let table_name = name.to_lowercase();
         
-        if self.catalog.tables.contains_key(&table_name) {
+        if self.active_catalog().tables.contains_key(&table_name) {
             return Err("table exists".to_string());
         }
         
@@ -647,23 +828,21 @@ impl Storage for PagedStorage {
         let first_page_id = self.create_new_page()?;
         
         // Register table metadata
-        self.catalog.tables.insert(table_name.clone(), TableMetadata {
+        self.active_catalog_mut()?.tables.insert(table_name.clone(), TableMetadata {
             schema: schema.clone(),
             next_row_id: 1,
             first_page_id,
             last_page_id: first_page_id,
         });
         
-        self.save_catalog()?;
-        
         Ok(())
     }
     
-    fn insert_row(&mut self, table: &str, row: Row) -> Result<(), String> {
+    fn insert_row_inner(&mut self, table: &str, row: Row) -> Result<(), String> {
         let table_name = table.to_lowercase();
         
         let (schema, row_id) = {
-            let table_meta = self.catalog.tables.get(&table_name)
+            let table_meta = self.active_catalog().tables.get(&table_name)
                 .ok_or("table not found")?;
             
             if row.len() != table_meta.schema.len() {
@@ -688,7 +867,7 @@ impl Storage for PagedStorage {
             Some(page_id) => page_id,
             None => {
                 // Create a new page
-                let prev_last_page_id = self.catalog.tables.get(&table_name)
+                let prev_last_page_id = self.active_catalog().tables.get(&table_name)
                     .ok_or("table not found")?
                     .last_page_id;
                 let new_page_id = self.create_new_page()?;
@@ -701,7 +880,7 @@ impl Storage for PagedStorage {
                 self.write_page(prev_last_page_id, &prev_page)?;
                 
                 // Update metadata
-                if let Some(table_meta) = self.catalog.tables.get_mut(&table_name) {
+                if let Some(table_meta) = self.active_catalog_mut()?.tables.get_mut(&table_name) {
                     table_meta.last_page_id = new_page_id;
                 }
                 
@@ -713,32 +892,17 @@ impl Storage for PagedStorage {
         self.add_row_to_page(target_page_id, row_id, &row_data)?;
         
         // Update metadata
-        if let Some(table_meta) = self.catalog.tables.get_mut(&table_name) {
+        if let Some(table_meta) = self.active_catalog_mut()?.tables.get_mut(&table_name) {
             table_meta.next_row_id += 1;
         }
-        
-        self.save_catalog()?;
         
         Ok(())
     }
     
-    fn schema(&self, table: &str) -> Result<&[ColumnDef], String> {
-        let table_name = table.to_lowercase();
-        self.catalog.tables
-            .get(&table_name)
-            .map(|t| t.schema.as_slice())
-            .ok_or("table not found".to_string())
-    }
-
-    fn rows<'a>(&'a self, _table: &str) -> Result<Box<dyn Iterator<Item = &'a Row> + 'a>, String> {
-        // Need to return references, but difficult to implement with paged storage
-        Err("Paged storage rows() method requires different implementation - use get_all_rows() instead".to_string())
-    }
-    
-    fn update_rows(&mut self, table: &str, assignments: &[Assignment], filter: Option<&Predicate>) -> Result<usize, String> {
+    fn update_rows_inner(&mut self, table: &str, assignments: &[Assignment], filter: Option<&Predicate>) -> Result<usize, String> {
         let table_name = table.to_lowercase();
         let (schema, first_page_id, last_page_id) = {
-            let table_meta = self.catalog.tables.get(&table_name)
+            let table_meta = self.active_catalog().tables.get(&table_name)
                 .ok_or("table not found")?;
             (table_meta.schema.clone(), table_meta.first_page_id, table_meta.last_page_id)
         };
@@ -763,16 +927,13 @@ impl Storage for PagedStorage {
             current_page_id = header.next_page;
         }
         
-        // Save catalog if new pages were created (metadata updated)
-        self.save_catalog()?;
-        
         Ok(total_updated)
     }
     
-    fn delete_rows(&mut self, table: &str, filter: Option<&Predicate>) -> Result<usize, String> {
+    fn delete_rows_inner(&mut self, table: &str, filter: Option<&Predicate>) -> Result<usize, String> {
         let table_name = table.to_lowercase();
         let (schema, first_page_id) = {
-            let table_meta = self.catalog.tables.get(&table_name)
+            let table_meta = self.active_catalog().tables.get(&table_name)
                 .ok_or("table not found")?;
             (table_meta.schema.clone(), table_meta.first_page_id)
         };
@@ -794,7 +955,57 @@ impl Storage for PagedStorage {
         
         Ok(total_deleted)
     }
-    
+}
+
+impl Storage for PagedStorage {
+    /// See `commit_changes_inner`. Every error is fatal.
+    fn commit_changes(&mut self) -> Result<(), FatalError> {
+        self.commit_changes_inner().map_err(FatalError)
+    }
+
+    /// Throw away the staged pages and the working catalog. The committed catalog
+    /// and the files are not touched, and nothing was written to the WAL yet.
+    fn abort_changes(&mut self) {
+        self.pending_pages.clear();
+        self.working_catalog = None;
+    }
+
+    // The four data-changing operations only stage their changes (pending_pages and
+    // the working catalog). `commit_changes` makes them durable; `abort_changes`
+    // discards them. Both are called by the executor.
+    fn create_table(&mut self, name: &str, schema: Vec<ColumnDef>) -> Result<(), String> {
+        self.begin_sql()?;
+        self.create_table_inner(name, schema)
+    }
+
+    fn insert_row(&mut self, table: &str, row: Row) -> Result<(), String> {
+        self.begin_sql()?;
+        self.insert_row_inner(table, row)
+    }
+
+    fn update_rows(&mut self, table: &str, assignments: &[Assignment], filter: Option<&Predicate>) -> Result<usize, String> {
+        self.begin_sql()?;
+        self.update_rows_inner(table, assignments, filter)
+    }
+
+    fn delete_rows(&mut self, table: &str, filter: Option<&Predicate>) -> Result<usize, String> {
+        self.begin_sql()?;
+        self.delete_rows_inner(table, filter)
+    }
+
+    fn schema(&self, table: &str) -> Result<&[ColumnDef], String> {
+        let table_name = table.to_lowercase();
+        self.catalog.tables
+            .get(&table_name)
+            .map(|t| t.schema.as_slice())
+            .ok_or("table not found".to_string())
+    }
+
+    fn rows<'a>(&'a self, _table: &str) -> Result<Box<dyn Iterator<Item = &'a Row> + 'a>, String> {
+        // Need to return references, but difficult to implement with paged storage
+        Err("Paged storage rows() method requires different implementation - use get_all_rows() instead".to_string())
+    }
+
     fn get_all_rows(&self, table: &str) -> Result<Vec<Row>, String> {
         // Due to Storage trait constraints, must implement with &self
         // Internally needs mutable reference, so as a temporary solution
@@ -929,7 +1140,7 @@ mod tests {
 
     /// Creates a fresh storage in a unique temp directory with table `t(id INT, name TEXT)`
     /// holding three rows whose names are 10 bytes long. All rows fit in one page.
-    fn setup(test_name: &str) -> (PagedStorage, String) {
+    fn setup_keeping_wal(test_name: &str) -> (PagedStorage, String) {
         let dir = std::env::temp_dir()
             .join(format!("mydb_paged_{}_{}", test_name, std::process::id()))
             .to_string_lossy()
@@ -940,9 +1151,26 @@ mod tests {
             ColumnDef { name: "id".into(), data_type: ColumnType::Int },
             ColumnDef { name: "name".into(), data_type: ColumnType::Text },
         ]).unwrap();
+        s.commit_changes().unwrap();
         for (id, name) in [(1, "aaaaaaaaaa"), (2, "bbbbbbbbbb"), (3, "cccccccccc")] {
             s.insert_row("t", vec![Value::Int(id), Value::Text(name.into())]).unwrap();
+            s.commit_changes().unwrap();
         }
+        (s, dir)
+    }
+
+    /// Empty the WAL file and restart LSN numbering at 1, so that a test only sees
+    /// the WAL records it produces itself.
+    fn clear_wal(s: &mut PagedStorage, dir: &str) {
+        let path = std::path::Path::new(dir).join("wal.log");
+        std::fs::write(&path, []).unwrap();
+        s.wal = Wal::open(&path).unwrap();
+    }
+
+    /// Like `setup_keeping_wal`, but with an empty WAL
+    fn setup(test_name: &str) -> (PagedStorage, String) {
+        let (mut s, dir) = setup_keeping_wal(test_name);
+        clear_wal(&mut s, &dir);
         (s, dir)
     }
 
@@ -959,9 +1187,584 @@ mod tests {
     }
 
     #[test]
+    fn write_page_stages_in_memory_until_committed() {
+        let (mut s, dir) = setup("stage_write");
+        let on_disk = s.read_page_from_file(0).unwrap();
+        let mut staged = on_disk.clone();
+        staged.as_mut_slice()[PAGE_SIZE - 1] = 0xCD;
+
+        s.write_page(0, &staged).unwrap();
+        // visible through read_page, but the page file is untouched
+        assert_eq!(s.read_page(0).unwrap().as_slice(), staged.as_slice());
+        assert_eq!(s.read_page_from_file(0).unwrap().as_slice(), on_disk.as_slice());
+
+        // commit writes the page (stamped with its LSN) to the page file
+        s.commit_changes().unwrap();
+        let committed = s.read_page_from_file(0).unwrap();
+        assert_eq!(committed.as_slice()[PAGE_SIZE - 1], 0xCD);
+        let header = PageHeader::from_bytes(&committed.as_slice()[..PAGE_HEADER_SIZE]).unwrap();
+        assert_eq!({ header.last_applied_lsn }, 1);
+        assert!(s.pending_pages.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_pages_are_staged_until_commit_and_dropped_by_abort() {
+        let (mut s, dir) = setup("pending_empty");
+        assert!(s.pending_pages.is_empty());
+
+        s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        assert!(!s.pending_pages.is_empty()); // staged, not written yet
+        s.commit_changes().unwrap();
+        assert!(s.pending_pages.is_empty());
+        s.delete_rows("t", Some(&id_eq(2))).unwrap();
+        s.commit_changes().unwrap();
+        assert!(s.pending_pages.is_empty());
+
+        // a failing statement: abort_changes discards whatever was staged
+        s.pending_pages.insert(0, Box::new(PageBytes::new()));
+        s.abort_changes();
+        assert!(s.pending_pages.is_empty());
+        // the page file was not damaged by the discarded image
+        assert_eq!(s.get_all_rows("t").unwrap(), vec![row(1, "x"), row(3, "cccccccccc")]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn read_wal_records(dir: &str) -> Vec<super::super::wal::WalRecord> {
+        let bytes = std::fs::read(std::path::Path::new(dir).join("wal.log")).unwrap();
+        super::super::wal::WalReader::new(&bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn append_changes_to_wal_writes_pages_catalog_and_commit_in_order() {
+        let (mut s, dir) = setup("wal_append_order");
+        s.begin_working_catalog();
+        let mut page = s.read_page(0).unwrap();
+        page.as_mut_slice()[PAGE_SIZE - 1] = 0xEE;
+        s.write_page(0, &page).unwrap();
+        s.active_catalog_mut().unwrap().next_page_id += 1;
+        let changes = s.build_pending_changes().unwrap();
+        assert_eq!(changes.len(), 2);
+
+        let stamped = s.append_changes_to_wal(&changes).unwrap();
+
+        let records = read_wal_records(&dir);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records.iter().map(|r| r.lsn).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(matches!(records[0].body, WalBody::FullPageWrite { page_id: 0, .. }));
+        assert!(matches!(records[1].body, WalBody::CatalogWrite { .. }));
+        assert!(matches!(records[2].body, WalBody::Commit));
+        assert_eq!(s.wal.next_lsn(), 4);
+        assert_eq!(stamped.len(), 1);
+        assert_eq!(stamped[0].0, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_page_image_is_stamped_with_its_own_lsn_and_matches_the_returned_image() {
+        let (mut s, dir) = setup("wal_append_stamp");
+        s.begin_working_catalog();
+        let mut page = s.read_page(0).unwrap();
+        page.as_mut_slice()[PAGE_SIZE - 1] = 0xEE;
+        s.write_page(0, &page).unwrap();
+        let changes = s.build_pending_changes().unwrap();
+        // the PendingChange keeps the unstamped image
+        let unstamped = match &changes[0] {
+            PendingChange::PageWrite { page_data, .. } => *page_data,
+            other => panic!("expected PageWrite, got {:?}", other),
+        };
+        // it still carries the LSN from the last commit of setup, not the new one
+        let lsn_on_disk = PageHeader::from_bytes(&page.as_slice()[..PAGE_HEADER_SIZE]).unwrap().last_applied_lsn;
+        assert_ne!(lsn_on_disk, 1);
+        assert_eq!({ PageHeader::from_bytes(&unstamped[..PAGE_HEADER_SIZE]).unwrap().last_applied_lsn }, lsn_on_disk);
+
+        let stamped = s.append_changes_to_wal(&changes).unwrap();
+
+        let records = read_wal_records(&dir);
+        let (lsn, wal_page) = match &records[0] {
+            r => match &r.body {
+                WalBody::FullPageWrite { page_data, .. } => (r.lsn, *page_data),
+                other => panic!("expected FullPageWrite, got {:?}", other),
+            },
+        };
+        let wal_header = PageHeader::from_bytes(&wal_page[..PAGE_HEADER_SIZE]).unwrap();
+        assert_eq!({ wal_header.last_applied_lsn }, lsn);
+        // the image returned for pages.dat is byte-for-byte the one in the WAL
+        assert_eq!(stamped[0].1.as_slice(), &wal_page[..]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_changes_to_wal_does_nothing_for_empty_changes() {
+        let (mut s, dir) = setup("wal_append_empty");
+        s.begin_working_catalog();
+        let changes = s.build_pending_changes().unwrap();
+        assert!(changes.is_empty());
+
+        assert!(s.append_changes_to_wal(&changes).unwrap().is_empty());
+        assert!(read_wal_records(&dir).is_empty());
+        assert_eq!(s.wal.next_lsn(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Stage a change to page 0 and to the catalog (next_row_id of table `t`)
+    fn stage_page_and_catalog_change(s: &mut PagedStorage) -> u32 {
+        s.begin_working_catalog();
+        let mut page = s.read_page(0).unwrap();
+        page.as_mut_slice()[PAGE_SIZE - 1] = 0xEE;
+        s.write_page(0, &page).unwrap();
+        let meta = s.active_catalog_mut().unwrap().tables.get_mut("t").unwrap();
+        meta.next_row_id += 1;
+        meta.next_row_id as u32
+    }
+
+    #[test]
+    fn commit_changes_makes_wal_pages_and_catalog_consistent() {
+        let (mut s, dir) = setup("commit_ok");
+        let new_next_row_id = stage_page_and_catalog_change(&mut s);
+
+        s.commit_changes().unwrap();
+
+        // WAL: FullPageWrite(page 0), CatalogWrite, Commit
+        let records = read_wal_records(&dir);
+        assert_eq!(records.iter().map(|r| r.lsn).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let wal_page = match &records[0].body {
+            WalBody::FullPageWrite { page_id: 0, page_data } => *page_data,
+            other => panic!("expected FullPageWrite of page 0, got {:?}", other),
+        };
+        assert!(matches!(records[1].body, WalBody::CatalogWrite { .. }));
+        assert!(matches!(records[2].body, WalBody::Commit));
+
+        // pages.dat holds exactly the bytes of the WAL, including last_applied_lsn
+        let on_disk = s.read_page_from_file(0).unwrap();
+        assert_eq!(on_disk.as_slice(), &wal_page[..]);
+        let header = PageHeader::from_bytes(&on_disk.as_slice()[..PAGE_HEADER_SIZE]).unwrap();
+        assert_eq!({ header.last_applied_lsn }, records[0].lsn);
+
+        // in-memory state: committed catalog replaced, temporary state dropped
+        assert_eq!(s.catalog.tables["t"].next_row_id as u32, new_next_row_id);
+        assert!(s.working_catalog.is_none());
+        assert!(s.pending_pages.is_empty());
+
+        // catalog.json has the new catalog
+        drop(s);
+        let reopened = PagedStorage::new(dir.clone()).unwrap();
+        assert_eq!(reopened.catalog.tables["t"].next_row_id as u32, new_next_row_id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn commit_changes_without_changes_writes_nothing() {
+        let (mut s, dir) = setup("commit_empty");
+        let catalog_json_before = std::fs::read(std::path::Path::new(&dir).join("catalog.json")).unwrap();
+        s.begin_working_catalog();
+
+        s.commit_changes().unwrap();
+
+        assert!(read_wal_records(&dir).is_empty());
+        assert_eq!(s.wal.next_lsn(), 1);
+        assert_eq!(
+            std::fs::read(std::path::Path::new(&dir).join("catalog.json")).unwrap(),
+            catalog_json_before
+        );
+        assert!(s.working_catalog.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failure_to_write_real_files_is_a_fatal_error_after_the_wal_commit() {
+        let (mut s, dir) = setup("commit_fatal");
+        stage_page_and_catalog_change(&mut s);
+        s.page_file = None; // simulate that pages.dat cannot be written
+
+        let result = s.commit_changes();
+
+        // reported as the fatal error type, not as an ordinary SQL error (String)
+        let error: FatalError = result.unwrap_err();
+        assert!(error.to_string().contains("Page file not open"));
+        // the commit itself is already durable in the WAL
+        let records = read_wal_records(&dir);
+        assert_eq!(records.len(), 3);
+        assert!(matches!(records[2].body, WalBody::Commit));
+        // nothing is discarded on failure
+        assert_eq!(s.pending_pages.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn abort_changes_discards_only_the_in_memory_state() {
+        let (mut s, dir) = setup("abort_changes");
+        let committed_next_row_id = s.catalog.tables["t"].next_row_id;
+        let page_on_disk = s.read_page_from_file(0).unwrap();
+        let wal_before = std::fs::read(std::path::Path::new(&dir).join("wal.log")).unwrap();
+        stage_page_and_catalog_change(&mut s);
+
+        s.abort_changes();
+
+        assert!(s.pending_pages.is_empty());
+        assert!(s.working_catalog.is_none());
+        assert_eq!(s.catalog.tables["t"].next_row_id, committed_next_row_id);
+        assert_eq!(s.read_page_from_file(0).unwrap().as_slice(), page_on_disk.as_slice());
+        assert_eq!(std::fs::read(std::path::Path::new(&dir).join("wal.log")).unwrap(), wal_before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stamp_last_applied_lsn_only_changes_the_lsn_field() {
+        let mut page = [7u8; PAGE_SIZE];
+        page[0..PAGE_HEADER_SIZE].copy_from_slice(&PageHeader::new(9).to_bytes());
+        let before = page;
+
+        PagedStorage::stamp_last_applied_lsn(&mut page, 42).unwrap();
+
+        assert_eq!(&page[20..28], &42u64.to_le_bytes());
+        for i in (0..PAGE_SIZE).filter(|i| !(20..28).contains(i)) {
+            assert_eq!(page[i], before[i], "byte {} changed", i);
+        }
+
+        // a page without a valid header is rejected
+        let mut broken = [0u8; PAGE_SIZE];
+        assert!(PagedStorage::stamp_last_applied_lsn(&mut broken, 1).is_err());
+    }
+
+    #[test]
+    fn new_creates_an_empty_wal_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("mydb_paged_wal_new_{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let s = PagedStorage::new(dir.clone()).unwrap();
+        let wal_path = std::path::Path::new(&dir).join("wal.log");
+        assert!(wal_path.exists());
+        assert_eq!(std::fs::read(&wal_path).unwrap().len(), 0);
+        assert_eq!(s.wal.next_lsn(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn new_fails_when_the_wal_is_corrupt() {
+        let dir = std::env::temp_dir()
+            .join(format!("mydb_paged_wal_corrupt_{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 5 bytes cannot even hold a WAL header
+        std::fs::write(std::path::Path::new(&dir).join("wal.log"), [1u8, 2, 3, 4, 5]).unwrap();
+
+        assert!(PagedStorage::new(dir.clone()).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_changes_have_one_page_write_per_page_in_page_id_order() {
+        let (mut s, dir) = setup("pending_changes_pages");
+        s.begin_working_catalog();
+        let mut page = PageBytes::new();
+        page.as_mut_slice()[100] = 1;
+        s.write_page(5, &page).unwrap();
+        s.write_page(2, &page).unwrap();
+        page.as_mut_slice()[100] = 2;
+        s.write_page(2, &page).unwrap(); // same page again: only the last image counts
+
+        let changes = s.build_pending_changes().unwrap();
+        assert_eq!(changes.len(), 2);
+        match (&changes[0], &changes[1]) {
+            (
+                PendingChange::PageWrite { page_id: a, page_data: a_data },
+                PendingChange::PageWrite { page_id: b, .. },
+            ) => {
+                assert_eq!((*a, *b), (2, 5));
+                assert_eq!(a_data[100], 2);
+            }
+            other => panic!("expected two PageWrites, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_changes_include_catalog_write_when_catalog_changed() {
+        let (mut s, dir) = setup("pending_changes_catalog");
+        let committed_next = s.catalog.next_page_id;
+
+        // an unchanged working catalog (e.g. DELETE) produces no CatalogWrite
+        s.begin_working_catalog();
+        assert!(s.build_pending_changes().unwrap().is_empty());
+
+        // a changed working catalog produces one CatalogWrite after the PageWrites
+        s.active_catalog_mut().unwrap().next_page_id += 3;
+        s.write_page(0, &PageBytes::new()).unwrap();
+        let changes = s.build_pending_changes().unwrap();
+        assert_eq!(changes.len(), 2);
+        assert!(matches!(changes[0], PendingChange::PageWrite { page_id: 0, .. }));
+        match &changes[1] {
+            PendingChange::CatalogWrite { catalog_json } => {
+                let restored: Catalog = serde_json::from_slice(catalog_json).unwrap();
+                assert_eq!(restored.next_page_id, committed_next + 3);
+            }
+            other => panic!("expected CatalogWrite, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn building_pending_changes_does_not_modify_state() {
+        let (mut s, dir) = setup("pending_changes_readonly");
+        s.begin_working_catalog();
+        s.active_catalog_mut().unwrap().next_page_id += 1;
+        s.write_page(3, &PageBytes::new()).unwrap();
+
+        let _ = s.build_pending_changes().unwrap();
+        assert_eq!(s.pending_pages.len(), 1);
+        assert!(s.pending_pages.contains_key(&3));
+        assert!(s.working_catalog.is_some());
+        assert_eq!(s.active_catalog().next_page_id, s.catalog.next_page_id + 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_sql_leaves_committed_catalog_unchanged() {
+        let (mut s, dir) = setup("failed_catalog");
+        let next_page_id = s.catalog.next_page_id;
+
+        // an SQL that allocates a page and then fails
+        s.begin_working_catalog();
+        let new_page_id = s.create_new_page().unwrap();
+        assert_eq!(new_page_id, next_page_id);
+        s.abort_changes();
+
+        assert_eq!(s.catalog.next_page_id, next_page_id);
+        assert!(s.working_catalog.is_none());
+        assert!(s.pending_pages.is_empty());
+
+        // a following statement still works and gets the same page id
+        s.insert_row("t", row(4, "dddddddddd")).unwrap();
+        s.commit_changes().unwrap();
+        assert_eq!(s.get_all_rows("t").unwrap().len(), 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn successful_sql_replaces_committed_catalog_and_persists_it() {
+        let (mut s, dir) = setup("commit_catalog");
+        let before = s.catalog.next_page_id;
+        // four rows of ~1KB each do not fit into the first page, so a second page is created
+        let big = "x".repeat(1000);
+        for i in 10..14 {
+            s.insert_row("t", row(i, &big)).unwrap();
+            s.commit_changes().unwrap();
+        }
+        assert!(s.catalog.next_page_id > before);
+        assert!(s.working_catalog.is_none());
+        let expected = s.get_all_rows("t").unwrap();
+        assert_eq!(expected.len(), 7);
+        drop(s);
+
+        let reopened = PagedStorage::new(dir.clone()).unwrap();
+        assert_eq!(reopened.get_all_rows("t").unwrap(), expected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Split the WAL records into transactions; each one ends with its Commit record
+    fn wal_transactions(dir: &str) -> Vec<Vec<super::super::wal::WalRecord>> {
+        let mut transactions = Vec::new();
+        let mut current = Vec::new();
+        for record in read_wal_records(dir) {
+            let is_commit = matches!(record.body, WalBody::Commit);
+            current.push(record);
+            if is_commit {
+                transactions.push(std::mem::take(&mut current));
+            }
+        }
+        assert!(current.is_empty(), "the WAL ends with records that have no Commit");
+        transactions
+    }
+
+    fn kinds(transaction: &[super::super::wal::WalRecord]) -> Vec<&'static str> {
+        transaction.iter().map(|r| match &r.body {
+            WalBody::FullPageWrite { .. } => "page",
+            WalBody::CatalogWrite { .. } => "catalog",
+            WalBody::Commit => "commit",
+        }).collect()
+    }
+
+    #[test]
+    fn every_statement_is_recorded_in_the_wal_as_one_transaction() {
+        let (mut s, dir) = setup_keeping_wal("wal_per_statement");
+        // setup ran CREATE TABLE and three INSERTs, each committed on its own
+        let tx = wal_transactions(&dir);
+        assert_eq!(tx.len(), 4);
+        for t in &tx {
+            assert_eq!(kinds(t), vec!["page", "catalog", "commit"]);
+        }
+        let lsns: Vec<u64> = read_wal_records(&dir).iter().map(|r| r.lsn).collect();
+        assert_eq!(lsns, (1..=12).collect::<Vec<u64>>());
+
+        // UPDATE that needs no new page, and DELETE: pages only, no CatalogWrite
+        s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        s.commit_changes().unwrap();
+        s.delete_rows("t", Some(&id_eq(2))).unwrap();
+        s.commit_changes().unwrap();
+        let tx = wal_transactions(&dir);
+        assert_eq!(tx.len(), 6);
+        assert_eq!(kinds(&tx[4]), vec!["page", "commit"]);
+        assert_eq!(kinds(&tx[5]), vec!["page", "commit"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_multi_page_insert_is_one_transaction_with_several_page_writes() {
+        let (mut s, dir) = setup("wal_multi_page");
+        let big = "x".repeat(1000);
+        for i in 10..14 {
+            s.insert_row("t", row(i, &big)).unwrap();
+            s.commit_changes().unwrap();
+        }
+
+        let tx = wal_transactions(&dir);
+        assert_eq!(tx.len(), 4);
+        // only the INSERT that did not fit created a page: the old tail page (next_page
+        // link) and the new page, in page_id order, then CatalogWrite, then one Commit
+        let multi: Vec<_> = tx.iter()
+            .filter(|t| kinds(t) == vec!["page", "page", "catalog", "commit"])
+            .collect();
+        assert_eq!(multi.len(), 1);
+        let page_ids: Vec<u32> = multi[0].iter().filter_map(|r| match &r.body {
+            WalBody::FullPageWrite { page_id, .. } => Some(*page_id),
+            _ => None,
+        }).collect();
+        assert_eq!(page_ids, vec![0, 1]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn aborting_a_multi_page_update_changes_nothing_and_the_storage_keeps_working() {
+        let (mut s, dir) = setup("abort_multi_page_update");
+        let big = "x".repeat(1000);
+        for i in 10..14 {
+            s.insert_row("t", row(i, &big)).unwrap();
+            s.commit_changes().unwrap();
+        }
+        let read_files = |dir: &str| {
+            let base = std::path::Path::new(dir);
+            (
+                std::fs::read(base.join("pages.dat")).unwrap(),
+                std::fs::read(base.join("catalog.json")).unwrap(),
+                std::fs::read(base.join("wal.log")).unwrap(),
+            )
+        };
+        let files_before = read_files(&dir);
+        let catalog_before = (s.catalog.next_page_id, s.catalog.tables["t"].next_row_id, s.catalog.tables["t"].last_page_id);
+        let rows_before = s.get_all_rows("t").unwrap();
+
+        // every row grows, so rows move to new pages (this stages several pages)
+        s.update_rows("t", &set_name(&"y".repeat(1020)), None).unwrap();
+        assert!(!s.pending_pages.is_empty());
+        // ... and then the SQL fails before commit_changes
+        s.abort_changes();
+
+        assert_eq!(read_files(&dir), files_before);
+        let catalog_after = (s.catalog.next_page_id, s.catalog.tables["t"].next_row_id, s.catalog.tables["t"].last_page_id);
+        assert_eq!(catalog_after, catalog_before);
+        assert_eq!(s.get_all_rows("t").unwrap(), rows_before);
+
+        // right after the failure, the same table accepts INSERT and SELECT
+        s.insert_row("t", row(99, "after")).unwrap();
+        s.commit_changes().unwrap();
+        let rows = s.get_all_rows("t").unwrap();
+        assert_eq!(rows.len(), rows_before.len() + 1);
+        assert!(rows.contains(&row(99, "after")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_new_statement_is_refused_until_the_previous_one_is_committed_or_aborted() {
+        let (mut s, dir) = setup("begin_guard");
+        s.insert_row("t", row(4, "dddddddddd")).unwrap();
+
+        let error = s.insert_row("t", row(5, "eeeeeeeeee")).unwrap_err();
+        assert!(error.contains("neither committed nor aborted"));
+
+        // the refused call did not disturb the open statement
+        s.commit_changes().unwrap();
+        assert_eq!(s.get_all_rows("t").unwrap().len(), 4);
+
+        // after an abort the next statement is accepted again
+        s.insert_row("t", row(5, "eeeeeeeeee")).unwrap();
+        s.abort_changes();
+        s.insert_row("t", row(6, "ffffffffff")).unwrap();
+        s.commit_changes().unwrap();
+        assert_eq!(s.get_all_rows("t").unwrap().len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn working_catalog_is_separate_from_committed_catalog() {
+        let (mut s, dir) = setup("working_catalog");
+        let committed_next = s.catalog.next_page_id;
+
+        // before begin: no working copy, so modification is refused
+        assert!(s.active_catalog_mut().is_err());
+        assert_eq!(s.active_catalog().next_page_id, committed_next);
+
+        s.begin_working_catalog();
+        s.active_catalog_mut().unwrap().next_page_id += 5;
+
+        // the working copy changes, the committed catalog does not
+        assert_eq!(s.active_catalog().next_page_id, committed_next + 5);
+        assert_eq!(s.catalog.next_page_id, committed_next);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_page_prefers_pending_pages_over_disk() {
+        let (mut s, dir) = setup("pending_read");
+
+        // page 0 exists on disk; a different image in pending_pages must win
+        let on_disk = s.read_page(0).unwrap();
+        let mut staged = on_disk.clone();
+        staged.as_mut_slice()[PAGE_SIZE - 1] = 0xAB;
+        assert_ne!(on_disk.as_slice(), staged.as_slice());
+        s.pending_pages.insert(0, staged.clone());
+        assert_eq!(s.read_page(0).unwrap().as_slice(), staged.as_slice());
+
+        // a page beyond the end of the file is readable through the map
+        let beyond = 100;
+        assert!(s.read_page(beyond).is_err());
+        s.pending_pages.insert(beyond, staged.clone());
+        assert_eq!(s.read_page(beyond).unwrap().as_slice(), staged.as_slice());
+
+        // without a pending entry, the disk content is read again
+        s.pending_pages.clear();
+        assert_eq!(s.read_page(0).unwrap().as_slice(), on_disk.as_slice());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn page_header_roundtrips_with_last_applied_lsn() {
+        let mut header = PageHeader::new(7);
+        assert_eq!({ header.last_applied_lsn }, 0);
+        header.last_applied_lsn = 0x0102_0304_0506_0708;
+        let decoded = PageHeader::from_bytes(&header.to_bytes()).unwrap();
+        assert_eq!({ decoded.page_id }, 7);
+        assert_eq!({ decoded.free_space_offset }, PAGE_HEADER_SIZE as u16);
+        assert_eq!({ decoded.last_applied_lsn }, 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn page_header_size_matches_constant() {
+        assert_eq!(std::mem::size_of::<PageHeader>(), PAGE_HEADER_SIZE);
+    }
+
+    #[test]
     fn shrinking_update_keeps_following_rows_readable() {
         let (mut s, dir) = setup("shrink_first");
         let n = s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        s.commit_changes().unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             s.get_all_rows("t").unwrap(),
@@ -974,6 +1777,7 @@ mod tests {
     fn shrinking_update_without_filter_updates_every_row() {
         let (mut s, dir) = setup("shrink_all");
         let n = s.update_rows("t", &set_name("x"), None).unwrap();
+        s.commit_changes().unwrap();
         assert_eq!(n, 3);
         assert_eq!(s.get_all_rows("t").unwrap(), vec![row(1, "x"), row(2, "x"), row(3, "x")]);
         let _ = std::fs::remove_dir_all(dir);
@@ -983,7 +1787,9 @@ mod tests {
     fn delete_after_shrinking_update_finds_following_rows() {
         let (mut s, dir) = setup("shrink_delete");
         s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        s.commit_changes().unwrap();
         let n = s.delete_rows("t", Some(&id_eq(3))).unwrap();
+        s.commit_changes().unwrap();
         assert_eq!(n, 1);
         assert_eq!(s.get_all_rows("t").unwrap(), vec![row(1, "x"), row(2, "bbbbbbbbbb")]);
         let _ = std::fs::remove_dir_all(dir);
@@ -993,7 +1799,9 @@ mod tests {
     fn shrunk_row_can_be_updated_again_to_original_length() {
         let (mut s, dir) = setup("shrink_regrow");
         s.update_rows("t", &set_name("x"), Some(&id_eq(2))).unwrap();
+        s.commit_changes().unwrap();
         s.update_rows("t", &set_name("yyyyyyyyyy"), Some(&id_eq(2))).unwrap();
+        s.commit_changes().unwrap();
         assert_eq!(
             s.get_all_rows("t").unwrap(),
             vec![row(1, "aaaaaaaaaa"), row(2, "yyyyyyyyyy"), row(3, "cccccccccc")]
@@ -1005,6 +1813,7 @@ mod tests {
     fn shrinking_update_is_visible_after_reopen() {
         let (mut s, dir) = setup("shrink_reopen");
         s.update_rows("t", &set_name("x"), Some(&id_eq(1))).unwrap();
+        s.commit_changes().unwrap();
         drop(s);
         let reopened = PagedStorage::new(dir.clone()).unwrap();
         assert_eq!(

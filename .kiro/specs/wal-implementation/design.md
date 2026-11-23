@@ -3,6 +3,7 @@
 ## WALログ
 
 WALの実ログファイル。
+WALファイルは、`catalog.json`、`pages.dat` と同じディレクトリの `wal.log` とする。
 
 ### データ構造
 
@@ -18,7 +19,7 @@ WALの実ログファイル。
 **ボディ**
 
 ```
-- FullPageWrite(table_id: u32, page_id: u32, page_data: [u8; 4096])
+- FullPageWrite(page_id: u32, page_data: [u8; 4096])
 - CatalogWrite(catalog_json: Vec<u8>)
 - Commit(Empty)
 ```
@@ -26,6 +27,9 @@ WALの実ログファイル。
 FullPageWriteはページ全体をそのままWALに書き込む。
 RecoveryはWALのページイメージをページファイルへ直接書き戻すため、
 ページファイルの構造が壊れていても（torn page）正しく復旧できる。
+
+ページは、テーブルをまたぐ通し番号 `page_id` だけで一意に特定できる。
+Recoveryも `page_id` だけでページの書き込み先を決めるため、WALレコードにテーブルIDは持たない。
 
 CatalogWriteは `catalog.json` 全体のイメージ（after-image）をWALに書き込む。
 長さは可変で、境界はヘッダの `len` で判別する。
@@ -59,7 +63,7 @@ FPW方式のため、変更後のページ全体と、変更後のカタログ�
 
 ```
 enum PendingChange {
-    PageWrite(table_id: u32, page_id: u32, page_data: [u8; 4096]),
+    PageWrite(page_id: u32, page_data: [u8; 4096]),
     CatalogWrite(catalog_json: Vec<u8>),
 }
 ```
@@ -270,7 +274,7 @@ Recoveryは、WALを先頭から順に読む。次のいずれかに当たった
 - 残りのバイト数が、ヘッダのサイズより小さい（ヘッダの途中で切れている）
 - `len` がヘッダのサイズより小さい、またはファイルの残りのバイト数より大きい（レコードの途中で切れている）
 - `type` が `FullPageWrite` / `CatalogWrite` / `Commit` のいずれでもない
-- `type` に対して `len` が正しくない（`FullPageWrite` は4121バイト、`Commit` は17バイトでない）
+- `type` に対して `len` が正しくない（`FullPageWrite` は4117バイト、`Commit` は17バイトでない）
 - チェックサムが一致しない
 
 - 判定は上から順に行う。`len` が信用できないと、チェックサムを計算する範囲が決まらないため
@@ -296,6 +300,8 @@ Recoveryは、WALを先頭から順に読む。次のいずれかに当たった
 - チェックサムの計算、WALへの `FullPageWrite` の書き込み、`pages.dat` への書き込みには、このLSN設定済みページイメージと同じバイト列を使う。WAL用と実データ用でイメージを別々に作らない。
 - 結果として、Commit後に `pages.dat` のページの `last_applied_lsn` は、WALの対応する `FullPageWrite` のLSNと一致する。
 - `PendingChange` 自体は変更しない。LSNは採番時にしか決まらないため、複製への書き込みはCommit時に行う。
+- `last_applied_lsn` を書き込む責任は、`PagedStorage`（`paged.rs`）が持つ。`Wal` は、次に採番するLSNを返す `next_lsn()` を公開する。`PagedStorage` は、複製したページイメージの `last_applied_lsn` に `next_lsn()` の値を書き込んでから、`Wal::append` を呼ぶ。`append` が返したLSNが、書き込んだ値と一致しない場合は、内部の不整合として致命的エラーにする。
+- 理由: `last_applied_lsn` の位置は、ページヘッダのレイアウトに属する。`wal.rs` はページの構造を知らず、レコードの符号化とファイルへの追記だけを担当する。チェックサムは `append` の中で、この書き込みのあとに計算されるため、WALに記録されるバイト列は、`pages.dat` に書くバイト列と同じになる。
 - `PageHeader` は現在20バイト（`_reserved` 2バイトを含む）。`last_applied_lsn`（8バイト）の追加で `PAGE_HEADER_SIZE` は28バイトになる。
 
 ### 将来対応（時間があれば）

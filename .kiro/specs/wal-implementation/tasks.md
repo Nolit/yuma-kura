@@ -4,42 +4,42 @@
 
 Pending ChangesとWALログの仕様については `.kiro/specs/wal-implementation/design.md` を参考にしてください。
 
-- [ ] `src/storage/pending.rs` を作成し、`PendingChange` を定義する。`PendingChange` は `PageWrite(table_id: u32, page_id: u32, page_data: [u8; 4096])` と `CatalogWrite(catalog_json: Vec<u8>)` の2種とする（ページ・カタログのイメージを持つStorage固有の型）
-- [ ] `PageHeader` に `last_applied_lsn: u64` を追加し、`PAGE_HEADER_SIZE` を20から28バイトに変更する（`from_bytes` / `to_bytes` も更新する）。既存の `pages.dat` とはレイアウトが互換でなくなるため、既存のデータファイルは作り直す
-- [ ] `Storage` トレイトの戻り値を変更し、各実装を更新する。`PendingChange` はStorage内部の型であり、トレイトの署名には出さない
+- [x] `src/storage/pending.rs` を作成し、`PendingChange` を定義する。`PendingChange` は `PageWrite(page_id: u32, page_data: [u8; 4096])` と `CatalogWrite(catalog_json: Vec<u8>)` の2種とする（ページ・カタログのイメージを持つStorage固有の型）
+- [x] `PageHeader` に `last_applied_lsn: u64` を追加し、`PAGE_HEADER_SIZE` を20から28バイトに変更する（`from_bytes` / `to_bytes` も更新する）。既存の `pages.dat` とはレイアウトが互換でなくなるため、既存のデータファイルは作り直す
+- [x] `Storage` トレイトの戻り値を変更し、各実装を更新する。`PendingChange` はStorage内部の型であり、トレイトの署名には出さない
   - `create_table` / `insert_row`: `Result<(), String>`
   - `update_rows` / `delete_rows`: `Result<usize, String>`（`usize` は更新・削除した行数）
   - MemStorage・CsvStorage は、これまでどおり呼び出し時点で実データへ書き込む
-- [ ] `PagedStorage` に、1つのSQLの実行中に変更したページを保持する一時マップ（page_id → ページイメージ）を導入する。`read_page` はまずこのマップを参照し、なければディスクから読む。1回のUPDATEで複数のページを変更したり、同じSQL内で作った新ページを再び読んだりするために必要となる
-- [ ] `PagedStorage` に、SQLの実行中に変更するカタログを保持する作業用カタログ（`Option<Catalog>` など）を導入する
+- [x] `PagedStorage` に、1つのSQLの実行中に変更したページを保持する一時マップ（page_id → ページイメージ）を導入する。`read_page` はまずこのマップを参照し、なければディスクから読む。1回のUPDATEで複数のページを変更したり、同じSQL内で作った新ページを再び読んだりするために必要となる
+- [x] `PagedStorage` に、SQLの実行中に変更するカタログを保持する作業用カタログ（`Option<Catalog>` など）を導入する
   - `create_table` / `insert_row` / `update_rows` / `delete_rows` の冒頭で、正式なカタログ（`self.catalog`）をコピーして作る。コピーのため `Catalog` / `TableMetadata` に `Clone` を derive する
   - `create_new_page`、`find_page_with_space`、`next_page_id` / `next_row_id` / `last_page_id` の採番と更新など、SQL実行中のカタログの参照と更新は、すべて作業用カタログに対して行う
   - 正式なカタログは、`commit_changes` のfsync成功後に作業用カタログで置き換えるまで変更しない
-- [ ] `PagedStorage::create_table` / `insert_row` / `update_rows` / `delete_rows` を、物理書き込みと `save_catalog` をせず、変更を一時マップと作業用カタログにだけ反映するように変更する。`PendingChange` は、ここでは作らない（`commit_changes` の中で作る。`design.md` の「Pending Changesの生成タイミング」参照）
+- [x] `PagedStorage::create_table` / `insert_row` / `update_rows` / `delete_rows` を、物理書き込みと `save_catalog` をせず、変更を一時マップと作業用カタログにだけ反映するように変更する。`PendingChange` は、ここでは作らない（`commit_changes` の中で作る。`design.md` の「Pending Changesの生成タイミング」参照）
   - `create_new_page` も物理書き込みをせず、新しいページのイメージを一時マップに保存する形に変更する
-- [ ] `PagedStorage` に、一時マップと作業用カタログから `PendingChange` のリストを作る処理を実装する（`commit_changes` から呼ぶ内部関数）
+- [x] `PagedStorage` に、一時マップと作業用カタログから `PendingChange` のリストを作る処理を実装する（`commit_changes` から呼ぶ内部関数）
   - 一時マップの各ページから、`page_id` 順に `PageWrite` を1件ずつ作る。新規ページ、データを書いたページ、`next_page` を更新した前の末尾ページは、すべて一時マップに入っているため、漏れなく `PageWrite` になる。同じページを何回変更しても1件だけになる
   - カタログが変わる操作（CREATE TABLE、INSERT、UPDATE での新ページ作成）では、変更後のカタログ全体を `CatalogWrite` として作る（DELETE は作らない）
-- [ ] `src/storage/wal.rs` を作成し、WALレコードのデータ構造（ヘッダ・ボディ。`FullPageWrite` / `CatalogWrite` / `Commit`）を定義する
-- [ ] `src/storage/wal.rs` にWALファイルへのappendロジックを実装する
+- [x] `src/storage/wal.rs` を作成し、WALレコードのデータ構造（ヘッダ・ボディ。`FullPageWrite` / `CatalogWrite` / `Commit`）を定義する
+- [x] `src/storage/wal.rs` にWALファイルへのappendロジックを実装する
   - LSNはレコードごとに+1採番する（初期値1）
-  - `FullPageWrite` の追記時は、そのレコードのLSNをページイメージのヘッダの `last_applied_lsn` に書き込んでから、チェックサム（CRC32）を計算する。LSNを設定したページイメージ（LSN設定済みページイメージ）は呼び出し元へ返し、`pages.dat` への書き込みにも同じバイト列を使えるようにする
+  - `Wal` は、次に採番するLSNを返す `next_lsn()` を公開する。`last_applied_lsn` の書き込みは、ページヘッダの構造を知る `PagedStorage` が、`append` の呼び出し前に行う（`design.md` の「`last_applied_lsn`」参照）。`append` は、レコードを符号化してチェックサム（CRC32）を計算し、`wal.log` に追記して、採番したLSNを返す
   - 起動時にWALを読み、最後の有効なレコードのLSN+1から採番を再開する（WALが空なら1）
   - WALを先頭から読む処理は、`dump`、LSNの再開、ステップ2のRecoveryで共通に使えるよう、1つの読み込み処理（レコードを1件ずつ返すイテレータなど）として実装する。読み込みを止める条件は、`design.md` の「WALの読み込みを止める条件」に従う
-- [ ] `PagedStorage` に `wal: Wal` フィールドを追加する
-- [ ] `Storage` トレイトに `commit_changes()`（引数なし）を追加する。戻り値は、致命的エラーを通常のSQLエラーと区別できる `Result` とする（エラー型は実装時に決める）。`commit_changes` の中のエラー（WALのappend、fsync、実ファイルへの書き込み）は、すべて致命的エラーとして返す。「Commit中・Commit後の失敗時の扱い」を参照
-- [ ] `Storage` トレイトに `abort_changes()` を追加する。SQLが `commit_changes` を呼ぶ前に失敗したときに、そのSQLの未Commitの変更（一時マップと作業用カタログ）を破棄するために呼ぶ。メモリ上のものを捨てるだけなので、戻り値は持たない
-- [ ] `PagedStorage::commit_changes` で、一時マップと作業用カタログから `PendingChange` を作り、作った順に（`PageWrite` は `page_id` 順）WALにappendし、Commitレコードをappendしてfsyncする。fsync成功後（Commit確定後）に、作業用カタログを正式なカタログに置き換え、その後で `PageWrite` を `pages.dat` に、`CatalogWrite` を `catalog.json` に書き込む。`PageWrite` ごとに `page_data` を複製してLSNを設定し、WALへの書き込みと `pages.dat` への書き込みには、このLSN設定済みページイメージの同じバイト列を使う（`PendingChange` 自体は変更しない）。書き込み後は、SQL実行中に使った一時マップを破棄する
-- [ ] `MemStorage::commit_changes` / `CsvStorage::commit_changes` は no-op として実装する（insert_row / update_rows / delete_rows 時点で既に書き込み済みのため）
-- [ ] `PagedStorage::abort_changes` で、一時マップと作業用カタログを破棄する。正式なカタログとページファイルは変更しない。`MemStorage::abort_changes` / `CsvStorage::abort_changes` は no-op として実装する（呼び出し時点で実データへ書き込み済みのため、破棄できない。「バックエンドごとの差異」参照）
-- [ ] `executor.rs` で CREATE TABLE / INSERT / UPDATE / DELETE 実行後、`storage.commit_changes()` を呼ぶ（auto commit）
-- [ ] `executor.rs` の CREATE TABLE / INSERT / UPDATE / DELETE 処理で、`commit_changes` を呼ぶ前にエラーが発生した場合は、`storage_mut().abort_changes()` を呼んでからエラーを返す。`commit_changes` が返したエラー（致命的エラー）では `abort_changes` を呼ばず、そのまま伝える
-- [ ] 致命的エラーを `main` まで伝え、プロセスを終了する
+- [x] `PagedStorage` に `wal: Wal` フィールドを追加する
+- [x] `Storage` トレイトに `commit_changes()`（引数なし）を追加する。戻り値は、致命的エラーを通常のSQLエラーと区別できる `Result` とする（エラー型は実装時に決める）。`commit_changes` の中のエラー（WALのappend、fsync、実ファイルへの書き込み）は、すべて致命的エラーとして返す。「Commit中・Commit後の失敗時の扱い」を参照
+- [x] `Storage` トレイトに `abort_changes()` を追加する。SQLが `commit_changes` を呼ぶ前に失敗したときに、そのSQLの未Commitの変更（一時マップと作業用カタログ）を破棄するために呼ぶ。メモリ上のものを捨てるだけなので、戻り値は持たない
+- [x] `PagedStorage::commit_changes` で、一時マップと作業用カタログから `PendingChange` を作り、作った順に（`PageWrite` は `page_id` 順）WALにappendし、Commitレコードをappendしてfsyncする。fsync成功後（Commit確定後）に、作業用カタログを正式なカタログに置き換え、その後で `PageWrite` を `pages.dat` に、`CatalogWrite` を `catalog.json` に書き込む。`PageWrite` ごとに `page_data` を複製してLSNを設定し、WALへの書き込みと `pages.dat` への書き込みには、このLSN設定済みページイメージの同じバイト列を使う（`PendingChange` 自体は変更しない）。書き込み後は、SQL実行中に使った一時マップを破棄する
+- [x] `MemStorage::commit_changes` / `CsvStorage::commit_changes` は no-op として実装する（insert_row / update_rows / delete_rows 時点で既に書き込み済みのため）
+- [x] `PagedStorage::abort_changes` で、一時マップと作業用カタログを破棄する。正式なカタログとページファイルは変更しない。`MemStorage::abort_changes` / `CsvStorage::abort_changes` は no-op として実装する（呼び出し時点で実データへ書き込み済みのため、破棄できない。「バックエンドごとの差異」参照）
+- [x] `executor.rs` で CREATE TABLE / INSERT / UPDATE / DELETE 実行後、`storage.commit_changes()` を呼ぶ（auto commit）
+- [x] `executor.rs` の CREATE TABLE / INSERT / UPDATE / DELETE 処理で、`commit_changes` を呼ぶ前にエラーが発生した場合は、`storage_mut().abort_changes()` を呼んでからエラーを返す。`commit_changes` が返したエラー（致命的エラー）では `abort_changes` を呼ばず、そのまま伝える
+- [x] 致命的エラーを `main` まで伝え、プロセスを終了する
   - `Engine::execute` の戻り値のエラー型を、致命的エラーと通常のSQLエラーを区別できる型にする
   - `executor.rs` は、`commit_changes` が返した致命的エラーを変換せずにそのまま伝える
   - `src/main.rs` は、致命的エラーを受け取ったら、エラー内容を標準エラーに出力し、0以外の終了コードでプロセスを終了する。通常のSQLエラーは、今までどおりエラーを表示してループを続ける
-- [ ] `src/storage/wal.rs` にWALファイルを読み込んで内容を表示する `dump` メソッドを実装する
-- [ ] `src/main.rs` に `dump-wal <path>` サブコマンドを追加し、`cargo run -- dump-wal <path>` でWALの内容をコンソールに表示できるようにする
+- [x] `src/storage/wal.rs` にWALファイルを読み込んで内容を表示する `dump` メソッドを実装する
+- [x] `src/main.rs` に `dump-wal <path>` サブコマンドを追加し、`cargo run -- dump-wal <path>` でWALの内容をコンソールに表示できるようにする
 
 ### ステップ1 完了条件
 
