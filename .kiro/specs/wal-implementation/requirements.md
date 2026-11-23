@@ -90,5 +90,4 @@ Acceptance Criteria:
 - **WAL**: Write-Ahead Log。データページ変更前にredo情報を書くログファイル
 - **LSN**: Log Sequence Number。WALレコードに割り当てる単調増加のID
 - **Pending Changes**: commit前の未確定変更をメモリ上に保持したもの
-- **TxId**: トランザクションID
 - **作業用カタログ**: SQL実行中の未確定のカタログ。SQLの実行開始時に正式なカタログからコピーして作る。Commit確定（WALのfsync成功）後に正式なカタログと置き換え、SQLが失敗した場合は破棄する

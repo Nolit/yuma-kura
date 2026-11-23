@@ -38,7 +38,7 @@ CatalogWriteは `catalog.json` 全体のイメージ（after-image）をWALに�
 - ページデータ更新前にfsyncされる
 - WALログはappend専用であり、fsync後にWALレコードが更新されることはない
 - 現時点ではコンパクションもせず、Commit済みのレコードが削除されることもない（将来対応予定）
-- ただし、Recoveryの最後に、最後のCommitレコードより後ろ（Commitされていないトランザクションのレコード）は切り詰める（ステップ3を参照）。破損したレコードがある場合は切り詰めず、Recoveryを失敗させる（「破損したWALの扱い」を参照）
+- ただし、Recoveryの最後に、最後のCommitレコードより後ろ（Commitされていないトランザクションのレコード）は切り詰める（ステップ2を参照）。破損したレコードがある場合は切り詰めず、Recoveryを失敗させる（「破損したWALの扱い」を参照）
 
 ---
 
@@ -50,19 +50,9 @@ Pending Changes は commit 時に WAL record へ変換され、永続化の対�
 
 ### データ構造
 
-以下のようにトランザクションID(TxId)とTransactionStateのハッシュマップとする。
-
-```
-HashMap<TxId, TransactionState>
-```
-
-TransactionStateは以下のようにPendingChangeのリストとする。
-
-```
-TransactionState {
-    changes: Vec<PendingChange>   // 1ページにつき1件（「Pending Changesの生成タイミング」参照）
-}
-```
+Pending Changesは、Storage内部の型 `PendingChange` のリストとする。
+Storageが `commit_changes` の中で、一時マップと作業用カタログから作る（「Pending Changesの生成タイミング」参照）。
+Engineは保持せず、トランザクションIDによる管理も行わない（「責務分担」参照）。
 
 PendingChangeは以下のような変更種別のenumとする。
 FPW方式のため、変更後のページ全体と、変更後のカタログ全体を保持する。
@@ -74,19 +64,27 @@ enum PendingChange {
 }
 ```
 
-### 型の置き場所
+### 責務分担
 
-`PendingChange` はページやカタログのイメージを持つStorage固有の構造のため、Storage層に置く。
-RULEBOOK の「Storage固有の構造をEngineの抽象に漏らさない」に従い、Engineは `PendingChange` の中身を読み書きしない。
+未確定の変更は、Storageが所有する。Engineは、Pending Changesの中身も、その保持も行わない。
+
+| 層 | 持つもの | 持たないもの |
+|---|---|---|
+| Engine | トランザクションの境界（いつCommit / abortするか）の判断 | `PendingChange`、一時マップ、作業用カタログ |
+| Storage（`PagedStorage`） | 一時マップ、作業用カタログ、そこから作る `PendingChange`、WALへの変換とappend、Commit手順 | トランザクション境界の判断 |
+
+理由:
+- `PendingChange` は、一時マップと作業用カタログから作られる派生物である。元の状態をStorageが持つ以上、派生物もStorageが所有するほうが一貫する。
+- Engineが `PendingChange` を保持しても、受け取ってそのまま返すだけで、中身を参照しない。保持する理由がない。
+- Engineが `PendingChange` を持つと、Storage固有の型がStorageトレイトの署名を通じてEngineに現れる。RULEBOOKの「Storage固有の構造をEngineの抽象に漏らさない」に反する。
+
+Storageは、同時に1つの作業単位だけを持つ（マルチスレッドと複数プロセスはNon-Goals）。トランザクションを識別する番号（TxId）は、Engine・Storage・WALのどこにも持たない。同時に開けるトランザクションは1つだけで、区別する必要がないため。Engineは、SQLの成功時に `commit_changes`、Commit前の失敗時に `abort_changes` をStorageに指示する。
 
 | 型 | 置き場所 | 役割 |
 |---|---|---|
-| `TxId` | `src/engine/pending.rs` | トランザクションID。論理的な概念のためEngineが管理する |
-| `TransactionState` | `src/engine/pending.rs` | `Vec<PendingChange>` を保持する。中身は見ない |
-| `PendingChange` | `src/storage/pending.rs` | ページ・カタログのイメージ。Storage固有 |
+| `PendingChange` | `src/storage/pending.rs` | ページ・カタログのイメージ。Storage内部の型であり、Storageの外へは出さない |
 
-- Engineは、Storageが返した `PendingChange` を `TransactionState` に溜め、`commit_changes` にそのまま渡すだけとする
-- `PendingChange` からWALレコードへの変換はStorage層（`wal.rs`）で行う。EngineはWALの存在を知らない
+`PendingChange` からWALレコードへの変換はStorage層（`wal.rs`）で行う。EngineはWALの存在を知らない。
 
 ### 制約
 
@@ -112,26 +110,26 @@ SQL実行中のカタログの変更は、作業用カタログ（「カタロ�
 - Commitのfsync成功後に、作業用カタログを正式なカタログに置き換える
 - SQLの失敗時に、作業用カタログを一時マップと一緒に破棄する
 
-将来、1トランザクションに複数のSQLを許す場合（ステップ2以降）は、この一時マップと作業用カタログをトランザクション単位に延ばす必要がある。
+将来、1トランザクションに複数のSQLを許す場合は、この一時マップと作業用カタログをトランザクション単位に延ばす必要がある。
 その延長がBuffer Poolの導入につながる。Buffer Poolを導入する際は、メモリ上のページキャッシュを
 空き場所算出の基準とする形に再設計する。
 
 ### Pending Changesの生成タイミング
 
-- SQL実行中は、ページの変更を一時マップにだけ反映する。`PendingChange` は、SQLの成功時に一時マップから作る。一時マップを、SQL実行中の最新ページの正本とする
-- SQLが成功した時点で、一時マップの各ページから `PageWrite` を1件ずつ作る。同じページを何回変更しても、`PageWrite` は最終状態の1件だけになる
+- SQL実行中は、ページの変更を一時マップにだけ反映する。`PendingChange` は、`commit_changes` の中で、一時マップと作業用カタログから作る。一時マップを、SQL実行中の最新ページの正本とする
+- `commit_changes` の時点で、一時マップの各ページから `PageWrite` を1件ずつ作る。同じページを何回変更しても、`PageWrite` は最終状態の1件だけになる
 - 作業用カタログが変わっていれば、`CatalogWrite` を1件作る
 - このため、1つのトランザクションの中で同じページは1回しか現れず、トランザクション内のレコードの順序はRecoveryの結果に影響しない。dumpの出力を安定させるため、`PageWrite` は `page_id` 順に並べる
 
 ### ライフサイクル
 
 - SQLの実行開始時に、正式なカタログから作業用カタログを作る
-- SQLの成功時に、一時マップと作業用カタログからpending changesを生成し、トランザクションID毎にバッファリングする（「Pending Changesの生成タイミング」参照）
-- SQLが失敗した場合は、pending changes、一時マップ、作業用カタログを破棄する（Commit前のため、WALには何も書かない）
-- Commit時にpending changesを元にredoログのレコードへ順番に変換
+- SQLの実行中は、変更を一時マップと作業用カタログにだけ溜める
+- SQLが失敗した場合は、一時マップと作業用カタログを破棄する（Commit前のため、WALには何も書かない。この時点では `PendingChange` はまだ作られていない）
+- Commit時（`commit_changes` の中）に、一時マップと作業用カタログからpending changesを生成し（「Pending Changesの生成タイミング」参照）、redoログのレコードへ順番に変換
 - WALのfsync成功後（Commit確定後）に、作業用カタログを正式なカタログに置き換える
 - 作業用カタログへの置き換え後に、pending changesを元にページデータとカタログを実ファイルへ変更
-- transaction完了時に対応するpending changesを破棄
+- `commit_changes` の完了時に、一時マップと、生成したpending changesを破棄
 - `commit_changes` の中で失敗した場合は、破棄せずに致命的エラーとして扱う（「Commit中・Commit後の失敗時の扱い」参照）
 
 ### 非スコープ
@@ -181,11 +179,10 @@ Commit前に正式なカタログを変更すると、SQLが途中で失敗し�
 
 1. SQLの実行開始時に、正式なカタログから作業用カタログを作る
 2. 作業用カタログと、ページの一時マップを変更する
-3. 変更内容を `PendingChange`（`PageWrite` / `CatalogWrite`）として登録する
-4. SQLが失敗した場合は、作業用カタログ、一時マップ、`PendingChange` を破棄する。正式なカタログは変更されていないため、これだけで元の状態に戻る（undoログは不要）
-5. SQLが成功した場合は、WALにappendしてfsyncする（Commit確定）
-6. fsync成功後に、作業用カタログを正式なカタログに置き換える
-7. `PageWrite` と `CatalogWrite` を実ファイルに書き込む
+3. SQLが失敗した場合は、作業用カタログと一時マップを破棄する。正式なカタログは変更されていないため、これだけで元の状態に戻る（undoログは不要）
+4. SQLが成功した場合は、`commit_changes` の中で、一時マップと作業用カタログから `PendingChange`（`PageWrite` / `CatalogWrite`）を作り、WALにappendしてfsyncする（Commit確定）
+5. fsync成功後に、作業用カタログを正式なカタログに置き換える
+6. `PageWrite` と `CatalogWrite` を実ファイルに書き込む
 
 - 作業用カタログは `PagedStorage` の内部で持つ。EngineはカタログJSONの中身も作業用カタログの存在も知らない
 - 作業用カタログのコピーは、DELETEなどカタログが変わらない操作でも同じ手順で作る（操作ごとに分岐させない）
@@ -227,7 +224,7 @@ Commit前に正式なカタログを変更すると、SQLが途中で失敗し�
 
 | 失敗が起きる段階 | 扱い |
 |---|---|
-| SQL実行中（`commit_changes` を呼ぶ前） | 作業用カタログ、一時マップ、`PendingChange` を破棄してエラーを返す。プロセスは継続する |
+| SQL実行中（`commit_changes` を呼ぶ前） | 作業用カタログと一時マップを破棄してエラーを返す。プロセスは継続する |
 | `commit_changes` の中（WALのappend、fsync、実ファイルへの書き込みのいずれか） | 致命的エラーとして扱う。プロセスを終了し、次回起動時のRecoveryに委ねる |
 
 ### `commit_changes` の失敗を致命的エラーとする理由
@@ -261,7 +258,7 @@ Commitの確定はWALのfsync成功であり、WALがあればRecoveryで復旧�
   - 例: `pages.dat` にページ0〜4があり、INSERTが新しいページ5を作る。Commit時にWALへ `FullPageWrite`（ページ5）、`FullPageWrite`（ページ4。`next_page` を5にしたもの）、`CatalogWrite`、`Commit` をappendしてfsyncした後、`pages.dat` へ書く前にクラッシュすると、WALにはページ5があるが、`pages.dat` にはページ0〜4しかない。Recoveryは、ページ5のイメージをファイルの末尾より先の位置に書き込み、ファイルを延ばす
   - 書き戻しはLSN順に行うので、`page_id` が大きいページが先に書かれ、小さいページが後で書かれる場合がある。その間は一時的にゼロ埋めの領域ができるが、同じCommitの後続のレコードが埋める
 - トランザクションの区切りは、Commitレコードの位置で決める。前のCommitレコードの直後から、次のCommitレコードまでのレコードを、1つのトランザクションとする
-  - WALレコードはトランザクションIDを持たない。メモリ上のTxIdは、Pending Changesの管理にだけ使う
+  - WALレコードはトランザクションIDを持たない。トランザクションIDは、どこにも持たない
   - 前提: レコードはCommit時にまとめてappendされるため、1つのトランザクションのレコードはWAL上で連続して並ぶ。複数のトランザクションのレコードを交互にappendする設計にする場合は、このルールを見直す
   - 注意: Commitレコードを書けずに、Commitなしのレコードが残ったまま追記を続けると、次のトランザクションのレコードと連続して、1つのトランザクションとして扱われる。これを防ぐため、`commit_changes` の中のエラーは致命的エラーとして処理を止め、Recoveryの最後にCommitなしのレコードを切り詰める
 - 最後のCommitレコードより後ろのレコードは、どのトランザクションにも属さないため、適用しない（Recoveryの最後に切り詰める）
@@ -298,7 +295,7 @@ Recoveryは、WALを先頭から順に読む。次のいずれかに当たった
 - Commit時、`PageWrite` ごとに `page_data` を複製し、そのレコードに採番したLSNを複製の `last_applied_lsn` に書き込む。これを「LSN設定済みページイメージ」と呼ぶ。
 - チェックサムの計算、WALへの `FullPageWrite` の書き込み、`pages.dat` への書き込みには、このLSN設定済みページイメージと同じバイト列を使う。WAL用と実データ用でイメージを別々に作らない。
 - 結果として、Commit後に `pages.dat` のページの `last_applied_lsn` は、WALの対応する `FullPageWrite` のLSNと一致する。
-- `PendingChange` 自体は変更しない（`commit_changes` は `&[PendingChange]` のまま）。LSNは採番時にしか決まらないため、複製への書き込みはCommit時に行う。
+- `PendingChange` 自体は変更しない。LSNは採番時にしか決まらないため、複製への書き込みはCommit時に行う。
 - `PageHeader` は現在20バイト（`_reserved` 2バイトを含む）。`last_applied_lsn`（8バイト）の追加で `PAGE_HEADER_SIZE` は28バイトになる。
 
 ### 将来対応（時間があれば）
